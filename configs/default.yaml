@@ -1,0 +1,21 @@
+﻿algorithm: online_niche_dqn_de_cmaes
+init_method: random
+accuracy: 1.0e-4
+phase:
+  min_phase1: 0.80
+  hard_phase2: 0.90
+rl:
+  hidden_dim: 64
+  buffer_capacity: 5000
+  batch_size: 64
+  gamma: 0.90
+  tau: 0.02
+  lr: 0.001
+  epsilon0: 0.10
+  temperature0: 2.0
+archive:
+  max_multiplier: 2
+cmaes:
+  enabled: true
+  min_sigma_ratio: 1.0e-4
+  max_sigma_ratio: 0.05
