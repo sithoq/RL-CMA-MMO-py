@@ -30,9 +30,17 @@ class PeakArchive:
     - 0.0：没有新增信息。
     """
 
-    def __init__(self, radius: float, max_size: int):
+    def __init__(
+        self,
+        radius: float,
+        max_size: int,
+        trim_mode: str = "fitness",
+        novelty_weight: float = 1.0,
+    ):
         self.radius = float(max(radius, 1e-12))
         self.max_size = int(max(1, max_size))
+        self.trim_mode = str(trim_mode)
+        self.novelty_weight = float(novelty_weight)
         self.entries: list[ArchiveEntry] = []
 
     def __len__(self) -> int:
@@ -76,5 +84,29 @@ class PeakArchive:
     def _trim(self) -> None:
         if len(self.entries) <= self.max_size:
             return
+        if self.trim_mode == "sparse_quality":
+            self._trim_sparse_quality()
+            return
         self.entries.sort(key=lambda item: item.fitness, reverse=True)
         del self.entries[self.max_size :]
+
+    def _trim_sparse_quality(self) -> None:
+        pop, fit = self.as_arrays()
+        if pop.shape[0] <= self.max_size:
+            return
+
+        fit_scale = float(np.ptp(fit) + 1e-12)
+        fit_norm = (fit - float(np.min(fit))) / fit_scale
+
+        if pop.shape[0] <= 1:
+            sparse_norm = np.zeros(pop.shape[0], dtype=float)
+        else:
+            dmat = np.linalg.norm(pop[:, None, :] - pop[None, :, :], axis=2)
+            np.fill_diagonal(dmat, np.inf)
+            nearest = np.min(dmat, axis=1)
+            dist_scale = float(np.max(nearest) + 1e-12)
+            sparse_norm = nearest / dist_scale
+
+        score = fit_norm + self.novelty_weight * sparse_norm
+        keep = np.argsort(score)[::-1][: self.max_size]
+        self.entries = [self.entries[int(i)] for i in keep]

@@ -11,6 +11,8 @@ import pandas as pd
 from tqdm import trange
 
 from rlmmo.algorithms.online_individual_dqn_de_cmaes import run_optimizer as run_individual_dqn
+from rlmmo.algorithms.online_individual_mpdqn_de_cmaes import run_optimizer as run_individual_mpdqn
+from rlmmo.algorithms.online_individual_mpdqn_v2_de_cmaes import run_optimizer as run_individual_mpdqn_v2
 from rlmmo.algorithms.online_niche_dqn_de_cmaes import run_optimizer as run_niche_dqn
 
 
@@ -18,6 +20,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 ALGORITHMS: dict[str, Callable[..., dict[str, Any]]] = {
     "online_niche_dqn_de_cmaes": run_niche_dqn,
     "online_individual_dqn_de_cmaes": run_individual_dqn,
+    "online_individual_mpdqn_de_cmaes": run_individual_mpdqn,
+    "online_individual_mpdqn_v2_de_cmaes": run_individual_mpdqn_v2,
 }
 
 
