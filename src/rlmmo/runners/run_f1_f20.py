@@ -20,6 +20,9 @@ def run_f1_f20(
     algorithm: str = "online_niche_dqn_de_cmaes",
     funcs: list[int] | None = None,
     max_fes: int | None = None,
+    diagnostics: bool = False,
+    diagnostic_interval: int = 1,
+    save_pop_snapshots: bool = False,
 ) -> tuple[Path, Path]:
     funcs = funcs or list(range(1, 21))
     out_dir = resolve_output_dir(out_dir)
@@ -29,7 +32,18 @@ def run_f1_f20(
     if workers <= 1:
         for func_num in funcs:
             csv_paths.append(
-                run_one_func(func_num, runs, seed_offset, init_method, out_dir, algorithm, max_fes=max_fes)
+                run_one_func(
+                    func_num,
+                    runs,
+                    seed_offset,
+                    init_method,
+                    out_dir,
+                    algorithm,
+                    max_fes=max_fes,
+                    diagnostics=diagnostics,
+                    diagnostic_interval=diagnostic_interval,
+                    save_pop_snapshots=save_pop_snapshots,
+                )
             )
     else:
         with ProcessPoolExecutor(max_workers=int(workers)) as pool:
@@ -44,6 +58,9 @@ def run_f1_f20(
                     algorithm,
                     None,
                     max_fes,
+                    diagnostics,
+                    diagnostic_interval,
+                    save_pop_snapshots,
                 ): func_num
                 for func_num in funcs
             }

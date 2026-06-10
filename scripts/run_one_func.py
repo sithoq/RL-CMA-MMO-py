@@ -20,6 +20,9 @@ def main() -> None:
     parser.add_argument("--algorithm", default="online_niche_dqn_de_cmaes")
     parser.add_argument("--np-size", type=int, default=None)
     parser.add_argument("--max-fes", type=int, default=None)
+    parser.add_argument("--diagnostics", action="store_true")
+    parser.add_argument("--diagnostic-interval", type=int, default=1)
+    parser.add_argument("--save-pop-snapshots", action="store_true")
     args = parser.parse_args()
     path = run_one_func(
         args.func,
@@ -30,6 +33,9 @@ def main() -> None:
         args.algorithm,
         args.np_size,
         args.max_fes,
+        args.diagnostics,
+        args.diagnostic_interval,
+        args.save_pop_snapshots,
     )
     print(path)
 

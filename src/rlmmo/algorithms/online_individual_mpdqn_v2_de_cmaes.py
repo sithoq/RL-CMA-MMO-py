@@ -15,6 +15,7 @@ import numpy as np
 
 from rlmmo.benchmarks.cec2013 import CEC2013Problem
 from rlmmo.core.archive import PeakArchive
+from rlmmo.core.diagnostics import DiagnosticsRecorder, action_entropy, hist_string
 from rlmmo.core.initialization import init_population
 from rlmmo.core.neighborhood import knn_indices
 from rlmmo.core.niching import NicheResult, build_dbscan_niches, pairwise_distances
@@ -39,6 +40,12 @@ class OptimizerConfig:
     archive_novelty_weight: float = 1.0
     high_peak_novelty_weight: float = 2.0
     head_exploration: float = 0.05
+    diagnostics: bool = False
+    diagnostic_interval: int = 1
+    checkpoint_ratios: list[float] = field(
+        default_factory=lambda: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    )
+    save_pop_snapshots: bool = False
     state_dim: int = STATE_DIM
     dqn: MultiPreferenceDQNConfig = field(default_factory=MultiPreferenceDQNConfig)
 
@@ -99,6 +106,15 @@ def run_optimizer(
     coverage_proxy = 0.0
     effective_archive_clusters = 0
     phase_switch_fes = max_fes_total
+    phase_switch_reason = "max_fes_exhausted"
+    generation_index = 0
+    diagnostic_interval = max(1, int(cfg.diagnostic_interval))
+    checkpoint_ratios = sorted(float(np.clip(x, 0.0, 1.0)) for x in cfg.checkpoint_ratios)
+    next_checkpoint = 0
+    diagnostics = DiagnosticsRecorder(
+        enabled=bool(cfg.diagnostics),
+        save_pop_snapshots=bool(cfg.save_pop_snapshots),
+    )
 
     # ========================= 阶段一：个体级 DQN-DE 找峰 =========================
     while fes < max_fes_total:
@@ -106,8 +122,26 @@ def run_optimizer(
         coverage_proxy, effective_archive_clusters = _coverage_proxy_from_archive(
             archive, problem.expected_peaks, lb, ub
         )
-        if _should_switch_phase_v2(progress, diversity_hist, success_hist, archive_hist, coverage_proxy, cfg):
+        should_switch, switch_reason = _should_switch_phase_v2(
+            progress, diversity_hist, success_hist, archive_hist, coverage_proxy, cfg
+        )
+        if should_switch:
             phase_switch_fes = fes
+            phase_switch_reason = switch_reason
+            _log_checkpoint(
+                diagnostics,
+                "phase_switch",
+                problem,
+                pop,
+                archive,
+                fitness,
+                lb,
+                ub,
+                fes,
+                max_fes_total,
+                cfg.accuracy,
+                coverage_proxy,
+            )
             break
 
         niches = build_dbscan_niches(pop, fitness, lb, ub)
@@ -118,6 +152,7 @@ def run_optimizer(
         local_success = np.clip(1.0 - individual_stag / max(1, np_size), 0.0, 1.0)
         archive_stall = len(archive_hist) >= 10 and archive_hist[-1] <= archive_hist[-10]
         action_ids = []
+        selected_heads = []
         for i in range(np_size):
             head_name = _select_head_by_state(
                 states[i],
@@ -128,6 +163,7 @@ def run_optimizer(
                 rng,
                 cfg.head_exploration,
             )
+            selected_heads.append(head_name)
             action_ids.append(agent.select_action(states[i], progress, rng, head_name=head_name))
         actions = [decode_action(aid) for aid in action_ids]
 
@@ -221,11 +257,77 @@ def run_optimizer(
         diversity_hist.append(_population_diversity(pop, lb, ub))
         success_hist.append(float(np.mean(replacement_success[np.flatnonzero(evaluated)])) if np.any(evaluated) else 0.0)
         archive_hist.append(len(archive))
+        generation_index += 1
+
+        coverage_proxy, effective_archive_clusters = _coverage_proxy_from_archive(
+            archive, problem.expected_peaks, lb, ub
+        )
+        _, candidate_reason = _should_switch_phase_v2(
+            fes / max_fes_total, diversity_hist, success_hist, archive_hist, coverage_proxy, cfg
+        )
+        if cfg.diagnostics and generation_index % diagnostic_interval == 0:
+            diagnostics.log_generation(
+                _generation_diagnostics_row(
+                    fes=fes,
+                    max_fes_total=max_fes_total,
+                    pop=pop,
+                    fitness=fitness,
+                    lb=lb,
+                    ub=ub,
+                    success_rate=success_hist[-1],
+                    archive_size=len(archive),
+                    coverage_proxy=coverage_proxy,
+                    effective_archive_clusters=effective_archive_clusters,
+                    niches=new_niches,
+                    individual_stag=individual_stag,
+                    action_ids=action_ids,
+                    actions=actions,
+                    selected_heads=selected_heads,
+                    head_names=agent.head_names,
+                    reward_vectors=reward_vectors,
+                    phase_switch_candidate_reason=candidate_reason,
+                )
+            )
+        while next_checkpoint < len(checkpoint_ratios) and fes / max_fes_total >= checkpoint_ratios[next_checkpoint]:
+            ratio = checkpoint_ratios[next_checkpoint]
+            _log_checkpoint(
+                diagnostics,
+                f"{int(round(ratio * 100)):03d}pct",
+                problem,
+                pop,
+                archive,
+                fitness,
+                lb,
+                ub,
+                fes,
+                max_fes_total,
+                cfg.accuracy,
+                coverage_proxy,
+            )
+            next_checkpoint += 1
 
     if phase_switch_fes == max_fes_total and fes < max_fes_total:
         phase_switch_fes = fes
+        phase_switch_reason = "max_fes_exhausted"
     coverage_proxy, effective_archive_clusters = _coverage_proxy_from_archive(
         archive, problem.expected_peaks, lb, ub
+    )
+    phase1_checkpoint = _checkpoint_metrics(
+        problem, pop, archive, fitness, lb, ub, fes, max_fes_total, cfg.accuracy, coverage_proxy
+    )
+    _log_checkpoint(
+        diagnostics,
+        "phase1_end",
+        problem,
+        pop,
+        archive,
+        fitness,
+        lb,
+        ub,
+        fes,
+        max_fes_total,
+        cfg.accuracy,
+        coverage_proxy,
     )
 
     # ========================= 阶段二：DBSCAN + 完整 CMA-ES 精搜 =========================
@@ -237,14 +339,35 @@ def run_optimizer(
         combo_pop = pop.copy()
         combo_fit = fitness.copy()
 
+    phase2_log: list[dict[str, Any]] = []
+    phase2_seed_count = 0
+    phase2_cmaes_used_fes = 0
+    refined_pop = np.empty((0, dim), dtype=float)
+
     if fes < max_fes_total and combo_pop.shape[0] > 0:
         combo_niches = build_dbscan_niches(combo_pop, combo_fit, lb, ub)
         seed_idx = combo_niches.seeds
         seeds = combo_pop[seed_idx]
         seed_fit = combo_fit[seed_idx]
-        refined_pop, refined_fit, used = refine_with_cmaes(
-            problem, seeds, seed_fit, max_fes_total - fes, lb, ub, rng
-        )
+        phase2_seed_count = int(seeds.shape[0])
+        seed_metadata = _seed_metadata(combo_niches, seed_idx, np_size)
+        if cfg.diagnostics:
+            refined_pop, refined_fit, used, phase2_log = refine_with_cmaes(
+                problem,
+                seeds,
+                seed_fit,
+                max_fes_total - fes,
+                lb,
+                ub,
+                rng,
+                diagnostics=True,
+                seed_metadata=seed_metadata,
+            )
+        else:
+            refined_pop, refined_fit, used = refine_with_cmaes(
+                problem, seeds, seed_fit, max_fes_total - fes, lb, ub, rng
+            )
+        phase2_cmaes_used_fes = int(used)
         fes += used
         final_pop = np.vstack([refined_pop, combo_pop])
         final_fit = np.concatenate([refined_fit, combo_fit])
@@ -253,9 +376,43 @@ def run_optimizer(
         final_fit = combo_fit
 
     found_peaks, _ = problem.count_goptima(final_pop, cfg.accuracy)
+    phase2_pr_gain = float(found_peaks / max(1, problem.expected_peaks) - phase1_checkpoint["PR_pop_archive"])
+    _mark_phase2_peak_contributions(problem, phase2_log, refined_pop, cfg.accuracy)
+    diagnostics.extend_phase2(phase2_log)
+    _log_checkpoint(
+        diagnostics,
+        "phase2_end",
+        problem,
+        final_pop,
+        archive,
+        final_fit,
+        lb,
+        ub,
+        fes,
+        max_fes_total,
+        cfg.accuracy,
+        coverage_proxy,
+    )
+    while next_checkpoint < len(checkpoint_ratios):
+        ratio = checkpoint_ratios[next_checkpoint]
+        _log_checkpoint(
+            diagnostics,
+            f"{int(round(ratio * 100)):03d}pct",
+            problem,
+            final_pop,
+            archive,
+            final_fit,
+            lb,
+            ub,
+            fes,
+            max_fes_total,
+            cfg.accuracy,
+            coverage_proxy,
+        )
+        next_checkpoint += 1
     runtime = perf_counter() - start_time
     pr = found_peaks / max(1, problem.expected_peaks)
-    return {
+    result = {
         "algorithm": "online_individual_mpdqn_v2_de_cmaes",
         "func_num": problem.func_num,
         "func_name": info.func_name,
@@ -275,6 +432,19 @@ def run_optimizer(
         "archive_size": int(len(archive)),
         "phase_switch_fes": int(phase_switch_fes),
         "phase_switch_ratio": float(phase_switch_fes / max_fes_total),
+        "phase_switch_reason": phase_switch_reason,
+        "phase1_PR_pop": float(phase1_checkpoint["PR_pop"]),
+        "phase1_PR_archive": float(phase1_checkpoint["PR_archive"]),
+        "phase1_PR_pop_archive": float(phase1_checkpoint["PR_pop_archive"]),
+        "phase1_archive_size": int(phase1_checkpoint["archive_size"]),
+        "phase1_cluster_count": int(phase1_checkpoint["cluster_count"]),
+        "phase2_seed_count": int(phase2_seed_count),
+        "phase2_cmaes_used_fes": int(phase2_cmaes_used_fes),
+        "phase2_improved_seed_count": int(sum(1 for row in phase2_log if bool(row.get("improved", False)))),
+        "phase2_mean_fitness_gain": float(np.mean([row["fitness_gain"] for row in phase2_log]))
+        if phase2_log
+        else 0.0,
+        "phase2_PR_gain": float(phase2_pr_gain),
         "coverage_proxy": float(coverage_proxy),
         "effective_archive_clusters": int(effective_archive_clusters),
         "dqn_action_hist": ";".join(map(str, agent.action_hist.tolist())),
@@ -283,6 +453,163 @@ def run_optimizer(
         "final_pop": final_pop,
         "final_fitness": final_fit,
     }
+    if cfg.diagnostics:
+        result["diagnostics_recorder"] = diagnostics
+    return result
+
+
+def _generation_diagnostics_row(
+    fes: int,
+    max_fes_total: int,
+    pop: np.ndarray,
+    fitness: np.ndarray,
+    lb: np.ndarray,
+    ub: np.ndarray,
+    success_rate: float,
+    archive_size: int,
+    coverage_proxy: float,
+    effective_archive_clusters: int,
+    niches: NicheResult,
+    individual_stag: np.ndarray,
+    action_ids: list[int],
+    actions: list[Any],
+    selected_heads: list[str],
+    head_names: list[str],
+    reward_vectors: np.ndarray,
+    phase_switch_candidate_reason: str,
+) -> dict[str, Any]:
+    """生成一代诊断日志行。
+
+    中文说明：这里只做统计，不读写算法状态，避免诊断开关影响优化轨迹。
+    """
+
+    head_to_id = {name: i for i, name in enumerate(head_names)}
+    head_ids = [head_to_id.get(name, 0) for name in selected_heads]
+    f_ids = [int(action.action_id) // 9 for action in actions]
+    cr_ids = [(int(action.action_id) // 3) % 3 for action in actions]
+    op_ids = [int(action.operator) for action in actions]
+    cluster_sizes = [len(members) for members in niches.members]
+    reward_mean = np.mean(reward_vectors, axis=0) if reward_vectors.size else np.zeros(5, dtype=float)
+    return {
+        "FES": int(fes),
+        "progress": float(fes / max(1, max_fes_total)),
+        "phase": "phase1",
+        "best_fitness": float(np.max(fitness)),
+        "mean_fitness": float(np.mean(fitness)),
+        "std_fitness": float(np.std(fitness)),
+        "diversity": float(_population_diversity(pop, lb, ub)),
+        "success_rate": float(success_rate),
+        "archive_size": int(archive_size),
+        "coverage_proxy": float(coverage_proxy),
+        "effective_archive_clusters": int(effective_archive_clusters),
+        "dbscan_cluster_count": int(len(niches.members)),
+        "mean_cluster_size": float(np.mean(cluster_sizes)) if cluster_sizes else 0.0,
+        "individual_stag_mean": float(np.mean(individual_stag)) if individual_stag.size else 0.0,
+        "individual_stag_max": float(np.max(individual_stag)) if individual_stag.size else 0.0,
+        "action_entropy": float(action_entropy(action_ids, ACTION_DIM)),
+        "selected_head_hist": hist_string(head_ids, len(head_names)),
+        "action_hist": hist_string(action_ids, ACTION_DIM),
+        "F_hist": hist_string(f_ids, 3),
+        "CR_hist": hist_string(cr_ids, 3),
+        "operator_hist": hist_string(op_ids, 3),
+        "reward_vector_mean": ";".join(f"{float(x):.6g}" for x in reward_mean),
+        "phase_switch_candidate_reason": phase_switch_candidate_reason,
+    }
+
+
+def _checkpoint_metrics(
+    problem: CEC2013Problem,
+    pop: np.ndarray,
+    archive: PeakArchive,
+    fitness: np.ndarray,
+    lb: np.ndarray,
+    ub: np.ndarray,
+    fes: int,
+    max_fes_total: int,
+    accuracy: float,
+    coverage_proxy: float,
+) -> dict[str, Any]:
+    archive_pop, archive_fit = archive.as_arrays()
+    found_pop, _ = problem.count_goptima(pop, accuracy) if pop.size else (0, np.empty((0, 0)))
+    if archive_pop.size:
+        found_archive, _ = problem.count_goptima(archive_pop, accuracy)
+        combo_pop = np.vstack([pop, archive_pop])
+        combo_fit = np.concatenate([fitness, archive_fit])
+    else:
+        found_archive = 0
+        combo_pop = pop
+        combo_fit = fitness
+    found_combo, _ = problem.count_goptima(combo_pop, accuracy) if combo_pop.size else (0, np.empty((0, 0)))
+    cluster_count = 0
+    if combo_pop.size:
+        cluster_count = len(build_dbscan_niches(combo_pop, combo_fit, lb, ub).members)
+    expected = max(1, int(problem.expected_peaks))
+    return {
+        "FES": int(fes),
+        "progress": float(fes / max(1, max_fes_total)),
+        "found_peaks_pop": int(found_pop),
+        "PR_pop": float(found_pop / expected),
+        "found_peaks_archive": int(found_archive),
+        "PR_archive": float(found_archive / expected),
+        "found_peaks_pop_archive": int(found_combo),
+        "PR_pop_archive": float(found_combo / expected),
+        "archive_size": int(len(archive)),
+        "cluster_count": int(cluster_count),
+        "coverage_proxy": float(coverage_proxy),
+    }
+
+
+def _log_checkpoint(
+    recorder: DiagnosticsRecorder,
+    label: str,
+    problem: CEC2013Problem,
+    pop: np.ndarray,
+    archive: PeakArchive,
+    fitness: np.ndarray,
+    lb: np.ndarray,
+    ub: np.ndarray,
+    fes: int,
+    max_fes_total: int,
+    accuracy: float,
+    coverage_proxy: float,
+) -> dict[str, Any]:
+    if not recorder.enabled:
+        return {}
+    row = _checkpoint_metrics(problem, pop, archive, fitness, lb, ub, fes, max_fes_total, accuracy, coverage_proxy)
+    row["label"] = label
+    archive_pop, _ = archive.as_arrays()
+    recorder.log_checkpoint(row, pop=pop, archive_pop=archive_pop)
+    return row
+
+
+def _seed_metadata(niches: NicheResult, seed_idx: np.ndarray, population_size: int) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for idx in np.asarray(seed_idx, dtype=int):
+        cluster_id = int(niches.assigned[idx]) if niches.assigned.size > idx else -1
+        cluster_size = len(niches.members[cluster_id]) if 0 <= cluster_id < len(niches.members) else 1
+        rows.append(
+            {
+                "source_cluster_id": cluster_id,
+                "cluster_size": int(cluster_size),
+                "seed_source": "archive" if int(idx) >= int(population_size) else "population",
+            }
+        )
+    return rows
+
+
+def _mark_phase2_peak_contributions(
+    problem: CEC2013Problem,
+    rows: list[dict[str, Any]],
+    refined_pop: np.ndarray,
+    accuracy: float,
+) -> None:
+    if not rows or refined_pop.size == 0:
+        return
+    for i, row in enumerate(rows):
+        if i >= refined_pop.shape[0]:
+            break
+        found, _ = problem.count_goptima(refined_pop[i : i + 1], accuracy)
+        row["final_found_peak_contribution"] = int(found > 0)
 
 
 def _make_config(config: dict[str, Any] | OptimizerConfig | None) -> OptimizerConfig:
@@ -557,20 +884,26 @@ def _should_switch_phase_v2(
     archive_hist: list[int],
     coverage_proxy: float,
     cfg: OptimizerConfig,
-) -> bool:
+) -> tuple[bool, str]:
     if progress >= cfg.hard_phase2:
-        return True
+        return True, "hard_phase2"
     if progress < cfg.min_phase1:
-        return False
+        return False, "not_allowed_before_min_phase1"
     if coverage_proxy < cfg.coverage_threshold:
-        return False
+        return False, "archive_stalled"
     if len(diversity_hist) < 12 or len(success_hist) < 12 or len(archive_hist) < 12:
-        return False
+        return False, "success_stalled"
     div_recent = float(np.mean(diversity_hist[-5:]))
     div_prev = float(np.mean(diversity_hist[-10:-5]))
     div_stalling = abs(div_recent - div_prev) < 1e-4
     rate_low = float(np.mean(success_hist[-5:])) < 0.02
     archive_stalling = archive_hist[-1] <= archive_hist[-10]
-    return bool(div_stalling and rate_low and archive_stalling)
+    if div_stalling and rate_low and archive_stalling:
+        return True, "coverage_ready_and_stalled"
+    if not div_stalling:
+        return False, "diversity_stalled"
+    if not rate_low:
+        return False, "success_stalled"
+    return False, "archive_stalled"
 
 

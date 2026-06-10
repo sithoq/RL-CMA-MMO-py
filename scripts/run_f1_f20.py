@@ -27,6 +27,9 @@ def main() -> None:
     parser.add_argument("--algorithm", default="online_niche_dqn_de_cmaes")
     parser.add_argument("--funcs", default="1:20")
     parser.add_argument("--max-fes", type=int, default=None)
+    parser.add_argument("--diagnostics", action="store_true")
+    parser.add_argument("--diagnostic-interval", type=int, default=1)
+    parser.add_argument("--save-pop-snapshots", action="store_true")
     args = parser.parse_args()
     csv_path, md_path = run_f1_f20(
         runs=args.runs,
@@ -37,6 +40,9 @@ def main() -> None:
         algorithm=args.algorithm,
         funcs=_parse_funcs(args.funcs),
         max_fes=args.max_fes,
+        diagnostics=args.diagnostics,
+        diagnostic_interval=args.diagnostic_interval,
+        save_pop_snapshots=args.save_pop_snapshots,
     )
     print(csv_path)
     print(md_path)
