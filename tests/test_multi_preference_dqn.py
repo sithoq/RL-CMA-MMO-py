@@ -45,3 +45,41 @@ def test_multi_preference_agent_selects_valid_action_for_each_head():
 
     assert sum(agent.action_hist) == len(agent.head_names)
     assert sum(agent.head_hist) == len(agent.head_names)
+
+
+def test_action_credit_increases_head_action_score():
+    rng = np.random.default_rng(23)
+    cfg = MultiPreferenceDQNConfig(
+        state_dim=5,
+        action_dim=7,
+        reward_dim=5,
+        hidden_dim=16,
+        action_credit_enabled=True,
+        action_credit_alpha=1.0,
+        action_credit_bonus=3.0,
+        action_credit_ucb=0.0,
+    )
+    agent = MultiPreferenceDoubleDQNAgent(cfg, device="cpu")
+    state = rng.random(5)
+
+    before = agent.action_scores(state, "coverage").copy()
+    agent.update_action_credit("coverage", 3, np.array([1.0, 0.0, 1.0, 0.0, 0.0]))
+    after = agent.action_scores(state, "coverage")
+
+    assert after[3] > before[3]
+    assert agent.action_credit[agent.head_names.index("coverage"), 3] > 0.0
+
+
+def test_action_credit_disabled_keeps_credit_zero():
+    cfg = MultiPreferenceDQNConfig(
+        state_dim=5,
+        action_dim=7,
+        reward_dim=5,
+        hidden_dim=16,
+        action_credit_enabled=False,
+    )
+    agent = MultiPreferenceDoubleDQNAgent(cfg, device="cpu")
+
+    agent.update_action_credit("coverage", 3, np.ones(5))
+
+    assert np.all(agent.action_credit == 0.0)

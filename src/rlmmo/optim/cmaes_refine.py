@@ -95,6 +95,8 @@ def _initial_log_rows(
                 "improved": False,
                 "nearest_seed_distance": float(nearest[i]) if i < nearest.size else 0.0,
                 "final_found_peak_contribution": 0,
+                "seed_rank_in_cluster": int(meta.get("seed_rank_in_cluster", 0)),
+                "seed_score": float(meta.get("seed_score", 0.0)),
             }
         )
     return rows

@@ -85,6 +85,10 @@ class MultiPreferenceDQNConfig:
     temperature0: float = 2.0
     q_clip: float = 10.0
     grad_clip: float = 1.0
+    action_credit_enabled: bool = True
+    action_credit_alpha: float = 0.10
+    action_credit_bonus: float = 1.0
+    action_credit_ucb: float = 0.15
     head_weights: dict[str, tuple[float, ...]] = field(default_factory=lambda: dict(DEFAULT_HEAD_WEIGHTS))
 
 
@@ -115,11 +119,28 @@ class MultiPreferenceDoubleDQNAgent:
         )
         self.action_hist = np.zeros(self.config.action_dim, dtype=int)
         self.head_hist = np.zeros(len(self.head_names), dtype=int)
+        self.action_credit = np.zeros((len(self.head_names), self.config.action_dim), dtype=float)
+        self.action_count = np.zeros((len(self.head_names), self.config.action_dim), dtype=float)
 
     @torch.no_grad()
     def q_values(self, state: np.ndarray, head_name: str) -> np.ndarray:
         s = torch.as_tensor(state, dtype=torch.float32, device=self.device).view(1, -1)
         return self.online(s, head_name).cpu().numpy().reshape(-1)
+
+    def action_scores(self, state: np.ndarray, head_name: str) -> np.ndarray:
+        """Return Q values augmented with fast per-head action credit."""
+
+        q = self.q_values(state, head_name)
+        if not self.config.action_credit_enabled:
+            return q
+
+        head_idx = self._head_index(head_name)
+        credit = self.action_credit[head_idx]
+        max_abs = float(np.max(np.abs(credit)))
+        credit_norm = credit / max_abs if max_abs > 1e-12 else np.zeros_like(credit)
+        total = float(np.sum(self.action_count[head_idx]))
+        ucb = np.sqrt(np.log(total + 1.0) / (self.action_count[head_idx] + 1.0))
+        return q + self.config.action_credit_bonus * credit_norm + self.config.action_credit_ucb * ucb
 
     def choose_head(self, progress: float, rng: np.random.Generator) -> str:
         """Progress-only fallback head schedule used by the v1 MPDQN algorithm."""
@@ -158,17 +179,43 @@ class MultiPreferenceDoubleDQNAgent:
         if rng.random() < epsilon:
             action = int(rng.integers(self.config.action_dim))
         else:
-            q = self.q_values(state, head)
+            q = self.action_scores(state, head)
             temperature = max(0.3, self.config.temperature0 * (1.0 - progress))
             q = q - np.max(q)
             probs = np.exp(q / temperature)
             probs = probs / np.sum(probs)
             action = int(rng.choice(self.config.action_dim, p=probs))
         self.action_hist[action] += 1
+        self.action_count[self._head_index(head), action] += 1.0
         return action
 
     def remember(self, state: np.ndarray, action: int, reward_vector: np.ndarray, next_state: np.ndarray) -> None:
         self.buffer.add(state, action, reward_vector, next_state)
+
+    def update_action_credit(self, head_name: str, action: int, reward_vector: np.ndarray) -> None:
+        """Update the fast bandit-style credit for one head/action pair."""
+
+        if not self.config.action_credit_enabled:
+            return
+        head_idx = self._head_index(head_name)
+        action = int(np.clip(action, 0, self.config.action_dim - 1))
+        reward = np.asarray(reward_vector, dtype=float).reshape(self.config.reward_dim)
+        weights = np.asarray(self.config.head_weights[head_name], dtype=float)
+        scalar_reward = float(np.dot(reward, weights))
+        alpha = float(np.clip(self.config.action_credit_alpha, 0.0, 1.0))
+        old = self.action_credit[head_idx, action]
+        self.action_credit[head_idx, action] = (1.0 - alpha) * old + alpha * scalar_reward
+
+    def head_action_credit_top(self, top_k: int = 3) -> str:
+        """CSV-friendly top credited actions per head."""
+
+        parts: list[str] = []
+        k = max(1, int(top_k))
+        for head_idx, head_name in enumerate(self.head_names):
+            order = np.argsort(self.action_credit[head_idx])[::-1][:k]
+            items = ",".join(f"{int(a)}:{self.action_credit[head_idx, int(a)]:.4g}" for a in order)
+            parts.append(f"{head_name}={items}")
+        return "|".join(parts)
 
     def train_step(self, rng: np.random.Generator) -> dict[str, float] | None:
         if self.buffer.size < self.config.batch_size:
@@ -210,3 +257,6 @@ class MultiPreferenceDoubleDQNAgent:
         with torch.no_grad():
             for target_param, online_param in zip(self.target.parameters(), self.online.parameters(), strict=False):
                 target_param.data.mul_(1.0 - tau).add_(online_param.data, alpha=tau)
+
+    def _head_index(self, head_name: str) -> int:
+        return self.head_names.index(head_name)

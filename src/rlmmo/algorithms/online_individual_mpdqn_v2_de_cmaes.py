@@ -40,6 +40,23 @@ class OptimizerConfig:
     archive_novelty_weight: float = 1.0
     high_peak_novelty_weight: float = 2.0
     head_exploration: float = 0.05
+    coverage_head_min_prob: float = 0.25
+    coverage_injection: bool = True
+    injection_min_progress: float = 0.10
+    injection_interval: int = 10
+    injection_frac: float = 0.10
+    high_peak_injection_frac: float = 0.15
+    injection_candidate_multiplier: int = 5
+    elite_frac: float = 0.05
+    multi_seed_cmaes: bool = True
+    seed_cluster_size: int = 12
+    seed_per_cluster_cap: int = 6
+    seed_global_multiplier: float = 1.25
+    seed_min_budget: int = 300
+    seed_sparsity_weight: float = 0.6
+    high_peak_phase2_threshold: float = 0.60
+    high_peak_hard_phase2: float = 0.95
+    phase2_min_budget_ratio: float = 0.03
     diagnostics: bool = False
     diagnostic_interval: int = 1
     checkpoint_ratios: list[float] = field(
@@ -103,6 +120,7 @@ def run_optimizer(
     diversity_hist: list[float] = []
     success_hist: list[float] = []
     archive_hist: list[int] = []
+    archive_cluster_hist: list[int] = []
     coverage_proxy = 0.0
     effective_archive_clusters = 0
     phase_switch_fes = max_fes_total
@@ -123,7 +141,16 @@ def run_optimizer(
             archive, problem.expected_peaks, lb, ub
         )
         should_switch, switch_reason = _should_switch_phase_v2(
-            progress, diversity_hist, success_hist, archive_hist, coverage_proxy, cfg
+            progress,
+            diversity_hist,
+            success_hist,
+            archive_hist,
+            coverage_proxy,
+            cfg,
+            expected_peaks=problem.expected_peaks,
+            effective_archive_clusters=effective_archive_clusters,
+            fes=fes,
+            max_fes_total=max_fes_total,
         )
         if should_switch:
             phase_switch_fes = fes
@@ -162,6 +189,9 @@ def run_optimizer(
                 archive_stall,
                 rng,
                 cfg.head_exploration,
+                coverage_proxy=coverage_proxy,
+                coverage_target=_target_coverage(progress),
+                coverage_head_min_prob=cfg.coverage_head_min_prob,
             )
             selected_heads.append(head_name)
             action_ids.append(agent.select_action(states[i], progress, rng, head_name=head_name))
@@ -244,6 +274,7 @@ def run_optimizer(
             pop, fitness, new_niches, lb, ub, individual_stag, global_stag, fes / max_fes_total
         )
         for i in range(np_size):
+            agent.update_action_credit(selected_heads[i], action_ids[i], reward_vectors[i])
             agent.remember(states[i], action_ids[i], reward_vectors[i], next_states[i])
         agent.train_step(rng)
 
@@ -262,8 +293,68 @@ def run_optimizer(
         coverage_proxy, effective_archive_clusters = _coverage_proxy_from_archive(
             archive, problem.expected_peaks, lb, ub
         )
+        archive_cluster_hist.append(effective_archive_clusters)
+
+        injection_count = 0
+        injection_archive_gain = 0.0
+        injection_best_fitness = 0.0
+        injection_reason = "none"
+        if generation_index % max(1, int(cfg.injection_interval)) == 0 and fes < max_fes_total:
+            should_inject, injection_reason = _should_inject_coverage(
+                progress=fes / max_fes_total,
+                success_hist=success_hist,
+                archive_cluster_hist=archive_cluster_hist,
+                coverage_proxy=coverage_proxy,
+                individual_stag=individual_stag,
+                np_size=np_size,
+                cfg=cfg,
+            )
+            if should_inject:
+                (
+                    injection_count,
+                    injection_archive_gain,
+                    injection_best_fitness,
+                    fes,
+                ) = _apply_coverage_injection(
+                    problem=problem,
+                    pop=pop,
+                    fitness=fitness,
+                    personal_best=personal_best,
+                    individual_stag=individual_stag,
+                    archive=archive,
+                    lb=lb,
+                    ub=ub,
+                    rng=rng,
+                    max_fes_total=max_fes_total,
+                    fes=fes,
+                    np_size=np_size,
+                    cfg=cfg,
+                )
+                coverage_proxy, effective_archive_clusters = _coverage_proxy_from_archive(
+                    archive, problem.expected_peaks, lb, ub
+                )
+                archive_cluster_hist[-1] = effective_archive_clusters
+                new_niches = build_dbscan_niches(pop, fitness, lb, ub)
+                diversity_hist[-1] = _population_diversity(pop, lb, ub)
+        elif cfg.coverage_injection:
+            injection_reason = "interval_skip"
+        if injection_count > 0:
+            injected_best = float(np.max(fitness))
+            if injected_best > global_best + 1e-12:
+                global_best = injected_best
+                global_stag = 0
+
         _, candidate_reason = _should_switch_phase_v2(
-            fes / max_fes_total, diversity_hist, success_hist, archive_hist, coverage_proxy, cfg
+            fes / max_fes_total,
+            diversity_hist,
+            success_hist,
+            archive_hist,
+            coverage_proxy,
+            cfg,
+            expected_peaks=problem.expected_peaks,
+            effective_archive_clusters=effective_archive_clusters,
+            fes=fes,
+            max_fes_total=max_fes_total,
         )
         if cfg.diagnostics and generation_index % diagnostic_interval == 0:
             diagnostics.log_generation(
@@ -285,6 +376,11 @@ def run_optimizer(
                     selected_heads=selected_heads,
                     head_names=agent.head_names,
                     reward_vectors=reward_vectors,
+                    head_action_credit_top=agent.head_action_credit_top(),
+                    injection_count=injection_count,
+                    injection_archive_gain=injection_archive_gain,
+                    injection_best_fitness=injection_best_fitness,
+                    injection_reason=injection_reason,
                     phase_switch_candidate_reason=candidate_reason,
                 )
             )
@@ -346,11 +442,20 @@ def run_optimizer(
 
     if fes < max_fes_total and combo_pop.shape[0] > 0:
         combo_niches = build_dbscan_niches(combo_pop, combo_fit, lb, ub)
-        seed_idx = combo_niches.seeds
+        seed_idx, seed_metadata = select_refinement_seeds(
+            combo_pop=combo_pop,
+            combo_fit=combo_fit,
+            combo_niches=combo_niches,
+            lb=lb,
+            ub=ub,
+            expected_peaks=problem.expected_peaks,
+            remaining_fes=max_fes_total - fes,
+            population_size=np_size,
+            config=cfg,
+        )
         seeds = combo_pop[seed_idx]
         seed_fit = combo_fit[seed_idx]
         phase2_seed_count = int(seeds.shape[0])
-        seed_metadata = _seed_metadata(combo_niches, seed_idx, np_size)
         if cfg.diagnostics:
             refined_pop, refined_fit, used, phase2_log = refine_with_cmaes(
                 problem,
@@ -476,6 +581,11 @@ def _generation_diagnostics_row(
     selected_heads: list[str],
     head_names: list[str],
     reward_vectors: np.ndarray,
+    head_action_credit_top: str,
+    injection_count: int,
+    injection_archive_gain: float,
+    injection_best_fitness: float,
+    injection_reason: str,
     phase_switch_candidate_reason: str,
 ) -> dict[str, Any]:
     """生成一代诊断日志行。
@@ -513,6 +623,11 @@ def _generation_diagnostics_row(
         "CR_hist": hist_string(cr_ids, 3),
         "operator_hist": hist_string(op_ids, 3),
         "reward_vector_mean": ";".join(f"{float(x):.6g}" for x in reward_mean),
+        "head_action_credit_top": head_action_credit_top,
+        "injection_count": int(injection_count),
+        "injection_archive_gain": float(injection_archive_gain),
+        "injection_best_fitness": float(injection_best_fitness),
+        "injection_reason": injection_reason,
         "phase_switch_candidate_reason": phase_switch_candidate_reason,
     }
 
@@ -610,6 +725,262 @@ def _mark_phase2_peak_contributions(
             break
         found, _ = problem.count_goptima(refined_pop[i : i + 1], accuracy)
         row["final_found_peak_contribution"] = int(found > 0)
+
+
+def _target_coverage(progress: float) -> float:
+    """Linear coverage target used by injection and head scheduling."""
+
+    progress = float(np.clip(progress, 0.0, 1.0))
+    if progress <= 0.10:
+        return 0.20
+    if progress >= 0.90:
+        return 0.80
+    return float(0.20 + (progress - 0.10) * (0.60 / 0.80))
+
+
+def _should_inject_coverage(
+    progress: float,
+    success_hist: list[float],
+    archive_cluster_hist: list[int],
+    coverage_proxy: float,
+    individual_stag: np.ndarray,
+    np_size: int,
+    cfg: OptimizerConfig,
+) -> tuple[bool, str]:
+    """Decide whether phase-one forced exploration should run."""
+
+    if not cfg.coverage_injection or progress < cfg.injection_min_progress:
+        return False, "not_allowed"
+    if coverage_proxy < _target_coverage(progress):
+        return True, "coverage_below_target"
+    if individual_stag.size and float(np.mean(individual_stag)) > 2.0 * max(1, int(np_size)):
+        return True, "individual_stagnated"
+    if len(success_hist) >= 10 and len(archive_cluster_hist) >= 20:
+        recent_success = float(np.mean(success_hist[-10:]))
+        cluster_growth = int(archive_cluster_hist[-1] - archive_cluster_hist[-20])
+        if recent_success < 0.02 and cluster_growth <= 1:
+            return True, "success_archive_stalled"
+    return False, "none"
+
+
+def _select_injection_replacement_indices(
+    fitness: np.ndarray,
+    individual_stag: np.ndarray,
+    injection_count: int,
+    elite_frac: float,
+) -> np.ndarray:
+    """Select stagnated non-elite individuals for forced exploration."""
+
+    fitness = np.asarray(fitness, dtype=float)
+    individual_stag = np.asarray(individual_stag, dtype=float)
+    n = fitness.size
+    count = int(np.clip(injection_count, 0, n))
+    if count <= 0:
+        return np.empty((0,), dtype=int)
+    elite_count = int(np.ceil(float(np.clip(elite_frac, 0.0, 1.0)) * n))
+    elite_count = min(max(0, elite_count), n)
+    elite = set(np.argsort(fitness)[::-1][:elite_count].astype(int).tolist())
+    candidates = [idx for idx in range(n) if idx not in elite]
+    if not candidates:
+        candidates = list(range(n))
+    order = sorted(candidates, key=lambda idx: (float(individual_stag[idx]), -float(fitness[idx])), reverse=True)
+    return np.asarray(order[:count], dtype=int)
+
+
+def _coverage_injection_points(
+    pop: np.ndarray,
+    archive: PeakArchive,
+    lb: np.ndarray,
+    ub: np.ndarray,
+    injection_count: int,
+    candidate_multiplier: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Generate far-from-archive and far-from-population injection points."""
+
+    count = int(max(0, injection_count))
+    if count <= 0:
+        return np.empty((0, pop.shape[1]), dtype=float)
+    candidate_count = max(50, int(candidate_multiplier) * count)
+    candidates = rng.uniform(lb, ub, size=(candidate_count, pop.shape[1]))
+    diag = float(np.linalg.norm(ub - lb) + 1e-12)
+
+    pop_dists = pairwise_distances(candidates, pop)
+    pop_nearest = np.min(pop_dists, axis=1) / diag if pop.size else np.ones(candidate_count, dtype=float)
+    archive_pop, _ = archive.as_arrays()
+    if archive_pop.size:
+        archive_dists = pairwise_distances(candidates, archive_pop)
+        archive_nearest = np.min(archive_dists, axis=1) / diag
+    else:
+        archive_nearest = np.ones(candidate_count, dtype=float)
+
+    score = 0.7 * _normalize01(archive_nearest) + 0.3 * _normalize01(pop_nearest)
+    selected: list[int] = []
+    for idx in np.argsort(score)[::-1]:
+        if len(selected) >= count:
+            break
+        selected.append(int(idx))
+    return candidates[np.asarray(selected, dtype=int)]
+
+
+def _apply_coverage_injection(
+    problem: CEC2013Problem,
+    pop: np.ndarray,
+    fitness: np.ndarray,
+    personal_best: np.ndarray,
+    individual_stag: np.ndarray,
+    archive: PeakArchive,
+    lb: np.ndarray,
+    ub: np.ndarray,
+    rng: np.random.Generator,
+    max_fes_total: int,
+    fes: int,
+    np_size: int,
+    cfg: OptimizerConfig,
+) -> tuple[int, float, float, int]:
+    """Force-restart stagnated non-elite individuals in sparse regions."""
+
+    remaining = int(max_fes_total - fes)
+    if remaining <= 0:
+        return 0, 0.0, 0.0, int(fes)
+    frac = cfg.high_peak_injection_frac if problem.expected_peaks >= 50 else cfg.injection_frac
+    requested = int(np.ceil(float(frac) * max(1, int(np_size))))
+    injection_count = int(min(max(1, requested), remaining, pop.shape[0]))
+    replace_idx = _select_injection_replacement_indices(fitness, individual_stag, injection_count, cfg.elite_frac)
+    if replace_idx.size == 0:
+        return 0, 0.0, 0.0, int(fes)
+
+    points = _coverage_injection_points(
+        pop,
+        archive,
+        lb,
+        ub,
+        replace_idx.size,
+        cfg.injection_candidate_multiplier,
+        rng,
+    )
+    archive_gain = 0.0
+    best_fit = -np.inf
+    used = 0
+    for local_pos, idx in enumerate(replace_idx):
+        if fes >= max_fes_total or local_pos >= points.shape[0]:
+            break
+        fit = float(problem.evaluate(points[local_pos]))
+        fes += 1
+        used += 1
+        pop[int(idx)] = points[local_pos]
+        fitness[int(idx)] = fit
+        personal_best[int(idx)] = fit
+        individual_stag[int(idx)] = 0.0
+        best_fit = max(best_fit, fit)
+        archive_gain += archive.add_or_update(points[local_pos], fit, source=2, fes=fes)
+    if used <= 0:
+        return 0, 0.0, 0.0, int(fes)
+    return int(used), float(archive_gain), float(best_fit), int(fes)
+
+
+def select_refinement_seeds(
+    combo_pop: np.ndarray,
+    combo_fit: np.ndarray,
+    combo_niches: NicheResult,
+    lb: np.ndarray,
+    ub: np.ndarray,
+    expected_peaks: int,
+    remaining_fes: int,
+    population_size: int,
+    config: OptimizerConfig,
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    """Select multiple sparse and high-quality CMA-ES seeds from each DBSCAN cluster."""
+
+    combo_pop = np.asarray(combo_pop, dtype=float)
+    combo_fit = np.asarray(combo_fit, dtype=float)
+    if combo_pop.size == 0 or not combo_niches.members:
+        return np.empty((0,), dtype=int), []
+    if not config.multi_seed_cmaes:
+        seed_idx = np.asarray(combo_niches.seeds, dtype=int)
+        return seed_idx, _seed_metadata(combo_niches, seed_idx, population_size)
+
+    global_cap = min(
+        int(np.ceil(max(1, expected_peaks) * float(config.seed_global_multiplier))),
+        max(1, int(remaining_fes) // max(1, int(config.seed_min_budget))),
+    )
+    if global_cap <= 0:
+        return np.empty((0,), dtype=int), []
+
+    span = np.maximum(ub - lb, 1e-12)
+    x_norm = (combo_pop - lb) / span
+    candidates: list[dict[str, Any]] = []
+    for cluster_id, members in enumerate(combo_niches.members):
+        members = np.asarray(members, dtype=int)
+        if members.size == 0:
+            continue
+        quota = min(int(config.seed_per_cluster_cap), int(np.ceil(members.size / max(1, config.seed_cluster_size))))
+        fit_norm = _normalize01(combo_fit[members])
+        sparsity = _cluster_local_sparsity(x_norm[members])
+        sparsity_norm = _normalize01(sparsity)
+        score = fit_norm + float(config.seed_sparsity_weight) * sparsity_norm
+        order = members[np.argsort(score)[::-1]]
+        score_by_idx = {int(idx): float(score[pos]) for pos, idx in enumerate(members)}
+        selected = _greedy_diverse_indices(order, x_norm, quota)
+        if selected.size < quota:
+            missing = [int(idx) for idx in order if int(idx) not in set(selected.tolist())]
+            selected = np.asarray(selected.tolist() + missing[: quota - selected.size], dtype=int)
+        for rank, idx in enumerate(selected[:quota]):
+            candidates.append(
+                {
+                    "idx": int(idx),
+                    "source_cluster_id": int(cluster_id),
+                    "cluster_size": int(members.size),
+                    "seed_source": "archive" if int(idx) >= int(population_size) else "population",
+                    "seed_rank_in_cluster": int(rank),
+                    "seed_score": float(score_by_idx[int(idx)]),
+                }
+            )
+
+    candidates.sort(key=lambda item: item["seed_score"], reverse=True)
+    kept = candidates[:global_cap]
+    seed_idx = np.asarray([item.pop("idx") for item in kept], dtype=int)
+    return seed_idx, kept
+
+
+def _cluster_local_sparsity(x_norm: np.ndarray) -> np.ndarray:
+    if x_norm.shape[0] <= 1:
+        return np.ones(x_norm.shape[0], dtype=float)
+    dmat = pairwise_distances(x_norm)
+    np.fill_diagonal(dmat, np.inf)
+    return np.min(dmat, axis=1)
+
+
+def _greedy_diverse_indices(order: np.ndarray, x_norm: np.ndarray, quota: int) -> np.ndarray:
+    order = np.asarray(order, dtype=int)
+    quota = int(max(0, quota))
+    if quota <= 0 or order.size == 0:
+        return np.empty((0,), dtype=int)
+    cluster_sparsity = _cluster_local_sparsity(x_norm[order])
+    positive = cluster_sparsity[np.isfinite(cluster_sparsity) & (cluster_sparsity > 0)]
+    min_sep = float(np.median(positive) * 0.5) if positive.size else 0.0
+    selected: list[int] = []
+    for idx in order:
+        idx = int(idx)
+        if not selected:
+            selected.append(idx)
+        else:
+            d = np.linalg.norm(x_norm[np.asarray(selected)] - x_norm[idx], axis=1)
+            if np.min(d) >= min_sep:
+                selected.append(idx)
+        if len(selected) >= quota:
+            break
+    return np.asarray(selected, dtype=int)
+
+
+def _normalize01(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    if values.size == 0:
+        return values
+    scale = float(np.ptp(values))
+    if scale <= 1e-12:
+        return np.zeros_like(values, dtype=float)
+    return (values - float(np.min(values))) / scale
 
 
 def _make_config(config: dict[str, Any] | OptimizerConfig | None) -> OptimizerConfig:
@@ -761,6 +1132,9 @@ def _select_head_by_state(
     archive_stall: bool,
     rng: np.random.Generator,
     exploration: float = 0.05,
+    coverage_proxy: float | None = None,
+    coverage_target: float | None = None,
+    coverage_head_min_prob: float = 0.25,
 ) -> str:
     """Select a preference head from local search state.
 
@@ -770,6 +1144,22 @@ def _select_head_by_state(
 
     if rng.random() < float(np.clip(exploration, 0.0, 1.0)):
         return str(rng.choice(["coverage", "quality", "diversity", "balanced"]))
+
+    if coverage_proxy is not None and coverage_target is not None and coverage_proxy < coverage_target:
+        min_cov = float(np.clip(coverage_head_min_prob, 0.0, 0.8))
+        probs = {
+            "coverage": max(0.35, min_cov),
+            "diversity": 0.35,
+            "balanced": 0.25,
+            "quality": 0.05,
+        }
+        return _sample_head_from_probs(probs, rng)
+
+    if progress >= 0.85:
+        return _sample_head_from_probs(
+            {"quality": 0.35, "balanced": 0.45, "coverage": 0.10, "diversity": 0.10},
+            rng,
+        )
 
     state = np.asarray(state, dtype=float)
     local_fit = float(state[14]) if state.size > 14 else 0.0
@@ -784,6 +1174,15 @@ def _select_head_by_state(
     if local_fit > 0.85 and neigh_stag < 0.20 and local_archive_dist < 0.25:
         return "quality"
     return "balanced"
+
+
+def _sample_head_from_probs(probs: dict[str, float], rng: np.random.Generator) -> str:
+    names = ["coverage", "quality", "diversity", "balanced"]
+    weights = np.asarray([float(probs.get(name, 0.0)) for name in names], dtype=float)
+    if np.sum(weights) <= 0:
+        weights = np.ones(len(names), dtype=float)
+    weights = weights / np.sum(weights)
+    return str(rng.choice(names, p=weights))
 
 
 def _archive_distances(points: np.ndarray, archive: PeakArchive, diag: float) -> np.ndarray:
@@ -884,8 +1283,17 @@ def _should_switch_phase_v2(
     archive_hist: list[int],
     coverage_proxy: float,
     cfg: OptimizerConfig,
+    expected_peaks: int = 0,
+    effective_archive_clusters: int = 0,
+    fes: int | None = None,
+    max_fes_total: int | None = None,
 ) -> tuple[bool, str]:
-    if progress >= cfg.hard_phase2:
+    if fes is not None and max_fes_total is not None:
+        remaining = int(max_fes_total - fes)
+        min_phase2 = _phase2_min_budget(max_fes_total, expected_peaks, effective_archive_clusters, cfg)
+        if remaining <= min_phase2 and progress >= cfg.min_phase1:
+            return True, "phase2_budget_floor"
+    if progress >= _effective_hard_phase2(expected_peaks, coverage_proxy, cfg):
         return True, "hard_phase2"
     if progress < cfg.min_phase1:
         return False, "not_allowed_before_min_phase1"
@@ -905,5 +1313,24 @@ def _should_switch_phase_v2(
     if not rate_low:
         return False, "success_stalled"
     return False, "archive_stalled"
+
+
+def _effective_hard_phase2(expected_peaks: int, coverage_proxy: float, cfg: OptimizerConfig) -> float:
+    if int(expected_peaks) >= 50 and coverage_proxy < float(cfg.high_peak_phase2_threshold):
+        return float(cfg.high_peak_hard_phase2)
+    return float(cfg.hard_phase2)
+
+
+def _phase2_min_budget(
+    max_fes_total: int,
+    expected_peaks: int,
+    effective_archive_clusters: int,
+    cfg: OptimizerConfig,
+) -> int:
+    seed_estimate = max(1, int(effective_archive_clusters) if effective_archive_clusters > 0 else int(expected_peaks))
+    seed_estimate = min(max(1, int(expected_peaks)), seed_estimate)
+    ratio_budget = int(np.ceil(float(cfg.phase2_min_budget_ratio) * int(max_fes_total)))
+    seed_budget = int(cfg.seed_min_budget) * seed_estimate
+    return int(max(ratio_budget, seed_budget))
 
 

@@ -38,6 +38,11 @@ GENERATION_COLUMNS = [
     "CR_hist",
     "operator_hist",
     "reward_vector_mean",
+    "head_action_credit_top",
+    "injection_count",
+    "injection_archive_gain",
+    "injection_best_fitness",
+    "injection_reason",
     "phase_switch_candidate_reason",
 ]
 
@@ -69,6 +74,9 @@ PHASE2_COLUMNS = [
     "improved",
     "nearest_seed_distance",
     "final_found_peak_contribution",
+    "cluster_count",
+    "seed_rank_in_cluster",
+    "seed_score",
 ]
 
 
