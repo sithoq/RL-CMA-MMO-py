@@ -76,25 +76,49 @@ def run_f1_f20(
 def summarize_results(csv_paths: list[Path], out_dir: Path) -> tuple[Path, Path]:
     frames = [pd.read_csv(path) for path in csv_paths]
     all_df = pd.concat(frames, ignore_index=True)
-    grouped = all_df.groupby("func_num", as_index=False).agg(
-        algorithm=("algorithm", "first"),
-        func_name=("func_name", "first"),
-        family=("family", "first"),
-        dimension=("dimension", "first"),
-        expected_peaks=("expected_peaks", "first"),
-        NP=("NP", "first"),
-        maxFES=("maxFES", "first"),
-        runs=("run_id", "count"),
-        mean_PR=("PR", "mean"),
-        std_PR=("PR", "std"),
-        best_PR=("PR", "max"),
-        worst_PR=("PR", "min"),
-        SR=("SR", "mean"),
-        mean_FES=("FES", "mean"),
-        mean_runtime=("runtime", "mean"),
-        mean_archive_size=("archive_size", "mean"),
-        mean_phase_switch_ratio=("phase_switch_ratio", "mean"),
-    )
+    aggregations = {
+        "algorithm": ("algorithm", "first"),
+        "func_name": ("func_name", "first"),
+        "family": ("family", "first"),
+        "dimension": ("dimension", "first"),
+        "expected_peaks": ("expected_peaks", "first"),
+        "NP": ("NP", "first"),
+        "maxFES": ("maxFES", "first"),
+        "runs": ("run_id", "count"),
+        "mean_PR": ("PR", "mean"),
+        "std_PR": ("PR", "std"),
+        "best_PR": ("PR", "max"),
+        "worst_PR": ("PR", "min"),
+        "SR": ("SR", "mean"),
+        "mean_FES": ("FES", "mean"),
+        "mean_runtime": ("runtime", "mean"),
+        "mean_archive_size": ("archive_size", "mean"),
+        "mean_phase_switch_ratio": ("phase_switch_ratio", "mean"),
+    }
+    optional_mean_columns = {
+        "phase1_PR_pop": "mean_phase1_PR_pop",
+        "phase1_PR_archive": "mean_phase1_PR_archive",
+        "phase1_PR_pop_archive": "mean_phase1_PR_pop_archive",
+        "phase1_archive_size": "mean_phase1_archive_size",
+        "phase1_cluster_count": "mean_phase1_cluster_count",
+        "phase2_seed_count": "mean_phase2_seed_count",
+        "phase2_cmaes_used_fes": "mean_phase2_cmaes_used_fes",
+        "phase2_improved_seed_count": "mean_phase2_improved_seed_count",
+        "phase2_mean_fitness_gain": "mean_phase2_mean_fitness_gain",
+        "phase2_PR_gain": "mean_phase2_PR_gain",
+        "coverage_proxy": "mean_coverage_proxy",
+        "effective_archive_clusters": "mean_effective_archive_clusters",
+    }
+    for source, target in optional_mean_columns.items():
+        if source in all_df.columns:
+            aggregations[target] = (source, "mean")
+    grouped = all_df.groupby("func_num", as_index=False).agg(**aggregations)
+    if {"mean_phase1_PR_archive", "mean_phase1_PR_pop"} <= set(grouped.columns):
+        grouped["mean_population_archive_gap"] = grouped["mean_phase1_PR_archive"] - grouped["mean_phase1_PR_pop"]
+    grouped = grouped[
+        [col for col in _summary_column_order() if col in grouped.columns]
+        + [col for col in grouped.columns if col not in _summary_column_order()]
+    ]
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     summary_csv = out_dir / f"server_summary_{stamp}.csv"
     summary_md = out_dir / f"server_summary_{stamp}.md"
@@ -113,4 +137,40 @@ def summarize_results(csv_paths: list[Path], out_dir: Path) -> tuple[Path, Path]
         f.write(table)
         f.write("\n")
     return summary_csv, summary_md
+
+
+def _summary_column_order() -> list[str]:
+    return [
+        "func_num",
+        "algorithm",
+        "func_name",
+        "family",
+        "dimension",
+        "expected_peaks",
+        "NP",
+        "maxFES",
+        "runs",
+        "mean_PR",
+        "std_PR",
+        "best_PR",
+        "worst_PR",
+        "SR",
+        "mean_phase1_PR_pop",
+        "mean_phase1_PR_archive",
+        "mean_phase1_PR_pop_archive",
+        "mean_population_archive_gap",
+        "mean_phase2_PR_gain",
+        "mean_phase2_seed_count",
+        "mean_phase2_cmaes_used_fes",
+        "mean_phase2_improved_seed_count",
+        "mean_coverage_proxy",
+        "mean_effective_archive_clusters",
+        "mean_FES",
+        "mean_runtime",
+        "mean_archive_size",
+        "mean_phase_switch_ratio",
+        "mean_phase1_archive_size",
+        "mean_phase1_cluster_count",
+        "mean_phase2_mean_fitness_gain",
+    ]
 
