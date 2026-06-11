@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -23,7 +24,9 @@ def main() -> None:
     parser.add_argument("--diagnostics", action="store_true")
     parser.add_argument("--diagnostic-interval", type=int, default=1)
     parser.add_argument("--save-pop-snapshots", action="store_true")
+    parser.add_argument("--algorithm-config-json", default=None)
     args = parser.parse_args()
+    algorithm_config = json.loads(args.algorithm_config_json) if args.algorithm_config_json else None
     path = run_one_func(
         args.func,
         args.runs,
@@ -36,6 +39,7 @@ def main() -> None:
         args.diagnostics,
         args.diagnostic_interval,
         args.save_pop_snapshots,
+        algorithm_config,
     )
     print(path)
 

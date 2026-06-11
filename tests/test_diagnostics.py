@@ -110,3 +110,26 @@ def test_runner_writes_diagnostics_csv_files(tmp_path):
     assert {"FES", "action_entropy", "operator_hist", "selected_head_hist"} <= set(
         pd.read_csv(generation_logs[0]).columns
     )
+
+
+def test_runner_accepts_algorithm_config_overrides(tmp_path):
+    csv_path = run_one_func(
+        func_num=1,
+        runs=1,
+        seed_offset=70,
+        init_method="random",
+        out_dir=tmp_path,
+        algorithm="online_individual_mpdqn_v2_de_cmaes",
+        np_size=20,
+        max_fes=1000,
+        diagnostics=True,
+        diagnostic_interval=1,
+        algorithm_config={"coverage_injection": False},
+    )
+
+    rows = pd.read_csv(csv_path)
+    generation_log = rows.loc[0, "generation_log_path"]
+    gen = pd.read_csv(generation_log)
+
+    assert "generation_log_path" in rows.columns
+    assert int(gen["injection_count"].sum()) == 0

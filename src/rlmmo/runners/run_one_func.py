@@ -51,6 +51,7 @@ def run_one_func(
     diagnostics: bool = False,
     diagnostic_interval: int = 1,
     save_pop_snapshots: bool = False,
+    algorithm_config: dict[str, Any] | None = None,
 ) -> Path:
     """运行某个 CEC2013 函数的多次重复，并保存 CSV/NPZ。"""
 
@@ -65,19 +66,22 @@ def run_one_func(
 
     for run_id in trange(1, int(runs) + 1, desc=f"F{func_num:02d}"):
         seed = int(seed_offset + run_id)
+        config = dict(algorithm_config or {})
+        if diagnostics and algorithm == "online_individual_mpdqn_v2_de_cmaes":
+            config.update(
+                {
+                    "diagnostics": True,
+                    "diagnostic_interval": int(diagnostic_interval),
+                    "save_pop_snapshots": bool(save_pop_snapshots),
+                }
+            )
         result = optimizer(
             func_num=func_num,
             seed=seed,
             np_size=np_size,
             max_fes=max_fes,
             init_method=init_method,
-            config={
-                "diagnostics": bool(diagnostics),
-                "diagnostic_interval": int(diagnostic_interval),
-                "save_pop_snapshots": bool(save_pop_snapshots),
-            }
-            if diagnostics and algorithm == "online_individual_mpdqn_v2_de_cmaes"
-            else None,
+            config=config or None,
         )
         recorder = result.pop("diagnostics_recorder", None)
         pop_path = out_dir / f"F{func_num:02d}_run{run_id:03d}_seed{seed}_{algorithm}_{init_method}_{stamp}.npz"

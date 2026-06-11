@@ -23,6 +23,7 @@ def run_f1_f20(
     diagnostics: bool = False,
     diagnostic_interval: int = 1,
     save_pop_snapshots: bool = False,
+    algorithm_config: dict | None = None,
 ) -> tuple[Path, Path]:
     funcs = funcs or list(range(1, 21))
     out_dir = resolve_output_dir(out_dir)
@@ -43,6 +44,7 @@ def run_f1_f20(
                     diagnostics=diagnostics,
                     diagnostic_interval=diagnostic_interval,
                     save_pop_snapshots=save_pop_snapshots,
+                    algorithm_config=algorithm_config,
                 )
             )
     else:
@@ -61,6 +63,7 @@ def run_f1_f20(
                     diagnostics,
                     diagnostic_interval,
                     save_pop_snapshots,
+                    algorithm_config,
                 ): func_num
                 for func_num in funcs
             }

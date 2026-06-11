@@ -41,8 +41,14 @@ GENERATION_COLUMNS = [
     "head_action_credit_top",
     "injection_count",
     "injection_archive_gain",
+    "injection_to_archive_count",
+    "injection_replaced_mean_fitness",
+    "injection_candidate_mean_fitness",
     "injection_best_fitness",
     "injection_reason",
+    "archive_reseed_count",
+    "archive_reseed_mean_fitness",
+    "archive_reseed_reason",
     "phase_switch_candidate_reason",
 ]
 
