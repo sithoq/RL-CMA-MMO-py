@@ -18,7 +18,9 @@ from rlmmo.runners.run_one_func import resolve_output_dir
 
 FUNC_CSV_RE = re.compile(r"^F(?P<func>\d{2})_\d+runs_.*\.csv$")
 RUN_NPZ_RE = re.compile(r"^F(?P<func>\d{2})_run(?P<run>\d{3})_seed(?P<seed>\d+)_.*\.npz$")
-HARD_FUNCS = {7, 8, 9, 14, 15, 16, 17, 18, 19, 20}
+CORE_FUNCS = {1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13}
+HIGH_PEAK_FUNCS = {8, 9}
+HARD_FUNCS = {14, 15, 16, 17, 18, 19, 20}
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,6 +28,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("result_dir", help="结果目录，例如 results/individual_knn_10runs")
     parser.add_argument("--accuracy", type=float, default=1e-4, help="count_goptima 精度，默认 1e-4")
     parser.add_argument("--out-prefix", default=None, help="输出文件前缀，默认为 result_dir/analysis")
+    parser.add_argument(
+        "--mechanism",
+        action="store_true",
+        help="额外输出机制分析表：phase1/archive/phase2/reseed/injection/action entropy 和失败类型。",
+    )
     return parser.parse_args()
 
 
@@ -62,6 +69,22 @@ def main() -> None:
     print(func_csv)
     print(overall_csv)
     print(report_md)
+
+    if args.mechanism:
+        mechanism_run_df = collect_mechanism_rows(result_dir)
+        if mechanism_run_df.empty:
+            print("mechanism analysis skipped: no function CSV rows found")
+            return
+        mechanism_func_df = summarize_mechanism_by_function(mechanism_run_df)
+        mech_run_csv = out_prefix.with_name(out_prefix.name + "_mechanism_runs.csv")
+        mech_func_csv = out_prefix.with_name(out_prefix.name + "_mechanism_functions.csv")
+        mech_report_md = out_prefix.with_name(out_prefix.name + "_mechanism_report.md")
+        mechanism_run_df.to_csv(mech_run_csv, index=False, encoding="utf-8-sig")
+        mechanism_func_df.to_csv(mech_func_csv, index=False, encoding="utf-8-sig")
+        write_mechanism_report(mech_report_md, mechanism_func_df)
+        print(mech_run_csv)
+        print(mech_func_csv)
+        print(mech_report_md)
 
 
 def collect_run_rows(result_dir: Path, accuracy: float) -> list[dict[str, Any]]:
@@ -128,6 +151,238 @@ def load_csv_rows(result_dir: Path) -> dict[tuple[int, int], dict[str, Any]]:
     return out
 
 
+def collect_mechanism_rows(result_dir: Path) -> pd.DataFrame:
+    """Collect per-run mechanism metrics from summary CSV and diagnostics logs.
+
+    中文说明：这个分析不重新评价函数，只读取已经落盘的 summary/diagnostics。
+    因此它适合服务器跑完实验后快速判断：问题主要出在阶段一覆盖、population
+    覆盖流失、阶段二 seed/CMA-ES，还是 injection/reseed 行为。
+    """
+
+    rows: list[dict[str, Any]] = []
+    diagnostics_dir = result_dir / "diagnostics"
+    for row in load_csv_rows(result_dir).values():
+        func_num = int(row["func_num"])
+        run_id = int(row["run_id"])
+        diag = _load_generation_diagnostics(row, diagnostics_dir)
+        phase2 = _load_phase2_diagnostics(row, diagnostics_dir)
+        base = {
+            "func_num": func_num,
+            "func_name": f"F{func_num:02d}",
+            "group": _function_group(func_num),
+            "run_id": run_id,
+            "PR": _safe_float(row.get("PR")),
+            "phase1_PR_pop": _safe_float(row.get("phase1_PR_pop")),
+            "phase1_PR_archive": _safe_float(row.get("phase1_PR_archive")),
+            "phase1_PR_pop_archive": _safe_float(row.get("phase1_PR_pop_archive")),
+            "phase2_PR_gain": _safe_float(row.get("phase2_PR_gain")),
+            "phase2_seed_count": _safe_float(row.get("phase2_seed_count")),
+            "phase2_improved_seed_count": _safe_float(row.get("phase2_improved_seed_count")),
+            "phase_switch_ratio": _safe_float(row.get("phase_switch_ratio")),
+            "archive_size": _safe_float(row.get("archive_size")),
+            "coverage_proxy": _safe_float(row.get("coverage_proxy")),
+            "effective_archive_clusters": _safe_float(row.get("effective_archive_clusters")),
+            "FES": _safe_float(row.get("FES")),
+            "maxFES": _safe_float(row.get("maxFES")),
+        }
+        base.update(_summarize_generation_log(diag))
+        base.update(_summarize_phase2_log(phase2))
+        base["population_archive_gap"] = base["phase1_PR_archive"] - base["phase1_PR_pop"]
+        base["phase2_effective"] = float(base["phase2_PR_gain"] >= 0.05)
+        base["failure_mode"] = classify_failure_mode(base)
+        base["next_action"] = recommend_next_action(base)
+        rows.append(base)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values(["func_num", "run_id"])
+
+
+def _load_generation_diagnostics(row: dict[str, Any], diagnostics_dir: Path) -> pd.DataFrame | None:
+    path = _diagnostic_path(row.get("generation_log_path"), diagnostics_dir)
+    if path is None or not path.exists():
+        return None
+    return pd.read_csv(path)
+
+
+def _load_phase2_diagnostics(row: dict[str, Any], diagnostics_dir: Path) -> pd.DataFrame | None:
+    path = _diagnostic_path(row.get("phase2_cmaes_log_path"), diagnostics_dir)
+    if path is None or not path.exists():
+        return None
+    return pd.read_csv(path)
+
+
+def _diagnostic_path(raw: Any, diagnostics_dir: Path) -> Path | None:
+    if raw is None or pd.isna(raw):
+        return None
+    path = Path(str(raw))
+    if path.exists():
+        return path
+    candidate = diagnostics_dir / path.name
+    if candidate.exists():
+        return candidate
+    return path
+
+
+def _summarize_generation_log(df: pd.DataFrame | None) -> dict[str, Any]:
+    if df is None or df.empty:
+        return {
+            "mean_action_entropy": np.nan,
+            "late_success_rate": np.nan,
+            "late_individual_stag_mean": np.nan,
+            "injection_total": np.nan,
+            "injection_to_archive_total": np.nan,
+            "archive_reseed_total": np.nan,
+            "last_archive_reseed_reason": "",
+            "last_injection_reason": "",
+        }
+    late = df.tail(min(20, len(df)))
+    return {
+        "mean_action_entropy": _col_mean(df, "action_entropy"),
+        "late_success_rate": _col_mean(late, "success_rate"),
+        "late_individual_stag_mean": _col_mean(late, "individual_stag_mean"),
+        "injection_total": _col_sum(df, "injection_count"),
+        "injection_to_archive_total": _col_sum(df, "injection_to_archive_count"),
+        "archive_reseed_total": _col_sum(df, "archive_reseed_count"),
+        "last_archive_reseed_reason": _last_text(df, "archive_reseed_reason"),
+        "last_injection_reason": _last_text(df, "injection_reason"),
+    }
+
+
+def _summarize_phase2_log(df: pd.DataFrame | None) -> dict[str, Any]:
+    if df is None or df.empty:
+        return {
+            "phase2_archive_seed_ratio": np.nan,
+            "phase2_mean_used_fes": np.nan,
+            "phase2_mean_seed_gain": np.nan,
+        }
+    if "seed_source" in df.columns:
+        archive_ratio = float((df["seed_source"].astype(str) == "archive").mean())
+    else:
+        archive_ratio = np.nan
+    return {
+        "phase2_archive_seed_ratio": archive_ratio,
+        "phase2_mean_used_fes": _col_mean(df, "used_fes"),
+        "phase2_mean_seed_gain": _col_mean(df, "fitness_gain"),
+    }
+
+
+def summarize_mechanism_by_function(run_df: pd.DataFrame) -> pd.DataFrame:
+    numeric_cols = [
+        "PR",
+        "phase1_PR_pop",
+        "phase1_PR_archive",
+        "phase1_PR_pop_archive",
+        "phase2_PR_gain",
+        "phase2_seed_count",
+        "phase_switch_ratio",
+        "coverage_proxy",
+        "effective_archive_clusters",
+        "population_archive_gap",
+        "mean_action_entropy",
+        "late_success_rate",
+        "late_individual_stag_mean",
+        "injection_total",
+        "injection_to_archive_total",
+        "archive_reseed_total",
+        "phase2_archive_seed_ratio",
+        "phase2_mean_used_fes",
+        "phase2_mean_seed_gain",
+    ]
+    agg = {col: (col, "mean") for col in numeric_cols if col in run_df.columns}
+    grouped = run_df.groupby("func_num", as_index=False).agg(
+        func_name=("func_name", "first"),
+        group=("group", "first"),
+        runs=("run_id", "count"),
+        **agg,
+    )
+    grouped["failure_mode"] = grouped.apply(lambda row: classify_failure_mode(row.to_dict()), axis=1)
+    grouped["next_action"] = grouped.apply(lambda row: recommend_next_action(row.to_dict()), axis=1)
+    return grouped.sort_values(["group", "func_num"])
+
+
+def classify_failure_mode(row: dict[str, Any]) -> str:
+    pr = _safe_float(row.get("PR"))
+    if pr >= 0.999:
+        return "solved"
+    phase1_combo = _safe_float(row.get("phase1_PR_pop_archive"))
+    archive_gap = _safe_float(row.get("population_archive_gap"))
+    phase2_gain = _safe_float(row.get("phase2_PR_gain"))
+    coverage = _safe_float(row.get("coverage_proxy"))
+    entropy = _safe_float(row.get("mean_action_entropy"))
+    injection_total = _safe_float(row.get("injection_total"))
+    if archive_gap >= 0.10:
+        return "population_coverage_drift"
+    if phase2_gain >= 0.10:
+        return "phase2_refinement_helpful"
+    if phase1_combo < 0.50 and coverage < 0.55:
+        return "missing_basin"
+    if injection_total > 500 and phase2_gain < 0.05:
+        return "injection_noise_or_no_gain"
+    if entropy >= 0.94:
+        return "weak_action_preference"
+    return "phase1_coverage_limited"
+
+
+def recommend_next_action(row: dict[str, Any]) -> str:
+    mode = classify_failure_mode(row)
+    func_num = int(_safe_float(row.get("func_num")))
+    if mode == "solved":
+        return "keep conservative defaults; use as regression guard"
+    if mode == "population_coverage_drift":
+        return "check archive_reseed_count; strengthen reseed before adding new exploration"
+    if mode == "phase2_refinement_helpful":
+        return "preserve CMA-ES budget and archive-prioritized seed selection"
+    if mode == "missing_basin":
+        if func_num in HARD_FUNCS:
+            return "add hard-function missing-basin recovery only after reseed validation"
+        return "increase phase-one basin discovery carefully; do not tune on F8/F9"
+    if mode == "injection_noise_or_no_gain":
+        return "reduce aggressive injection; require quality-gated archive writes"
+    if mode == "weak_action_preference":
+        return "keep action credit diagnostics; do not rely on DQN alone for coverage"
+    return "compare phase1 archive/pop and phase2 gain in next diagnostics run"
+
+
+def _function_group(func_num: int) -> str:
+    if func_num in CORE_FUNCS:
+        return "core"
+    if func_num in HIGH_PEAK_FUNCS:
+        return "high_peak_record_only"
+    if func_num in HARD_FUNCS:
+        return "hard"
+    return "other"
+
+
+def write_mechanism_report(report_md: Path, func_df: pd.DataFrame) -> None:
+    focus = func_df[func_df["func_num"].isin(sorted(CORE_FUNCS | HARD_FUNCS))]
+    with report_md.open("w", encoding="utf-8") as f:
+        f.write("# Mechanism Analysis Report\n\n")
+        f.write("This report reads existing summary/diagnostics CSV files only; it does not call `count_goptima` again.\n\n")
+        f.write("## Focus Functions\n\n")
+        cols = [
+            "func_name",
+            "group",
+            "runs",
+            "PR",
+            "phase1_PR_pop",
+            "phase1_PR_archive",
+            "population_archive_gap",
+            "phase2_PR_gain",
+            "phase2_seed_count",
+            "mean_action_entropy",
+            "injection_total",
+            "archive_reseed_total",
+            "failure_mode",
+            "next_action",
+        ]
+        existing = [col for col in cols if col in focus.columns]
+        f.write(to_markdown_table(focus[existing]))
+        f.write("\n\n## Failure Mode Counts\n\n")
+        counts = func_df["failure_mode"].value_counts().rename_axis("failure_mode").reset_index(name="function_count")
+        f.write(to_markdown_table(counts))
+        f.write("\n")
+
+
 def summarize_by_function(run_df: pd.DataFrame) -> pd.DataFrame:
     grouped = run_df.groupby("func_num", as_index=False).agg(
         func_name=("func_name", "first"),
@@ -181,6 +436,35 @@ def make_overall_row(name: str, df: pd.DataFrame) -> dict[str, Any]:
         "mean_archive_size": float(df["mean_archive_size"].mean()),
         "mean_phase_switch_ratio": float(df["mean_phase_switch_ratio"].mean()),
     }
+
+
+def _safe_float(value: Any, default: float = np.nan) -> float:
+    try:
+        if value is None or pd.isna(value):
+            return float(default)
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _col_mean(df: pd.DataFrame, col: str) -> float:
+    if col not in df.columns:
+        return np.nan
+    values = pd.to_numeric(df[col], errors="coerce")
+    return float(values.mean()) if values.notna().any() else np.nan
+
+
+def _col_sum(df: pd.DataFrame, col: str) -> float:
+    if col not in df.columns:
+        return np.nan
+    values = pd.to_numeric(df[col], errors="coerce")
+    return float(values.sum()) if values.notna().any() else np.nan
+
+
+def _last_text(df: pd.DataFrame, col: str) -> str:
+    if col not in df.columns or df.empty:
+        return ""
+    return str(df[col].iloc[-1])
 
 
 def write_report(report_md: Path, run_df: pd.DataFrame, func_df: pd.DataFrame, overall_df: pd.DataFrame) -> None:
