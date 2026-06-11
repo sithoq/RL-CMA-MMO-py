@@ -33,6 +33,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="额外输出机制分析表：phase1/archive/phase2/reseed/injection/action entropy 和失败类型。",
     )
+    parser.add_argument(
+        "--baseline-dir",
+        default=None,
+        help="与当前 result_dir 做机制对比的基线目录；需要配合 --mechanism 使用。",
+    )
     return parser.parse_args()
 
 
@@ -85,6 +90,20 @@ def main() -> None:
         print(mech_run_csv)
         print(mech_func_csv)
         print(mech_report_md)
+        if args.baseline_dir:
+            baseline_dir = resolve_output_dir(args.baseline_dir)
+            baseline_run_df = collect_mechanism_rows(baseline_dir)
+            if baseline_run_df.empty:
+                print(f"mechanism comparison skipped: no baseline rows found in {baseline_dir}")
+            else:
+                baseline_func_df = summarize_mechanism_by_function(baseline_run_df)
+                compare_df = compare_mechanism_functions(baseline_func_df, mechanism_func_df)
+                compare_csv = out_prefix.with_name(out_prefix.name + "_mechanism_compare.csv")
+                compare_report_md = out_prefix.with_name(out_prefix.name + "_mechanism_compare_report.md")
+                compare_df.to_csv(compare_csv, index=False, encoding="utf-8-sig")
+                write_mechanism_compare_report(compare_report_md, compare_df, baseline_dir, result_dir)
+                print(compare_csv)
+                print(compare_report_md)
 
 
 def collect_run_rows(result_dir: Path, accuracy: float) -> list[dict[str, Any]]:
@@ -300,6 +319,119 @@ def summarize_mechanism_by_function(run_df: pd.DataFrame) -> pd.DataFrame:
     return grouped.sort_values(["group", "func_num"])
 
 
+def compare_mechanism_functions(baseline_df: pd.DataFrame, current_df: pd.DataFrame) -> pd.DataFrame:
+    """Compare two mechanism summaries function by function."""
+
+    keep_cols = [
+        "func_num",
+        "func_name",
+        "group",
+        "runs",
+        "PR",
+        "phase1_PR_pop",
+        "phase1_PR_archive",
+        "phase1_PR_pop_archive",
+        "phase2_PR_gain",
+        "population_archive_gap",
+        "mean_action_entropy",
+        "injection_total",
+        "injection_to_archive_total",
+        "archive_reseed_total",
+        "failure_mode",
+        "next_action",
+    ]
+    base = baseline_df[[col for col in keep_cols if col in baseline_df.columns]].copy()
+    curr = current_df[[col for col in keep_cols if col in current_df.columns]].copy()
+    merged = base.merge(curr, on="func_num", how="outer", suffixes=("_baseline", "_current"))
+
+    for name in ["func_name", "group"]:
+        merged[name] = merged.get(f"{name}_current").combine_first(merged.get(f"{name}_baseline"))
+
+    delta_pairs = [
+        ("PR", "delta_PR"),
+        ("phase1_PR_pop", "delta_phase1_PR_pop"),
+        ("phase1_PR_archive", "delta_phase1_PR_archive"),
+        ("phase1_PR_pop_archive", "delta_phase1_PR_pop_archive"),
+        ("phase2_PR_gain", "delta_phase2_PR_gain"),
+        ("population_archive_gap", "delta_population_archive_gap"),
+        ("mean_action_entropy", "delta_action_entropy"),
+        ("injection_total", "delta_injection_total"),
+        ("injection_to_archive_total", "delta_injection_to_archive_total"),
+        ("archive_reseed_total", "delta_archive_reseed_total"),
+    ]
+    for source, target in delta_pairs:
+        merged[target] = _merged_numeric(merged, f"{source}_current") - _merged_numeric(merged, f"{source}_baseline")
+
+    merged["comparison_status"] = merged.apply(classify_comparison_status, axis=1)
+    merged["comparison_note"] = merged.apply(make_comparison_note, axis=1)
+
+    ordered_cols = [
+        "func_num",
+        "func_name",
+        "group",
+        "PR_baseline",
+        "PR_current",
+        "delta_PR",
+        "phase1_PR_pop_archive_baseline",
+        "phase1_PR_pop_archive_current",
+        "delta_phase1_PR_pop_archive",
+        "population_archive_gap_baseline",
+        "population_archive_gap_current",
+        "delta_population_archive_gap",
+        "phase2_PR_gain_baseline",
+        "phase2_PR_gain_current",
+        "delta_phase2_PR_gain",
+        "injection_total_baseline",
+        "injection_total_current",
+        "delta_injection_total",
+        "archive_reseed_total_baseline",
+        "archive_reseed_total_current",
+        "delta_archive_reseed_total",
+        "failure_mode_baseline",
+        "failure_mode_current",
+        "comparison_status",
+        "comparison_note",
+    ]
+    existing = [col for col in ordered_cols if col in merged.columns]
+    return merged[existing].sort_values(["group", "func_num"])
+
+
+def classify_comparison_status(row: pd.Series) -> str:
+    delta_pr = _safe_float(row.get("delta_PR"))
+    delta_gap = _safe_float(row.get("delta_population_archive_gap"))
+    current_pr = _safe_float(row.get("PR_current"))
+    if current_pr >= 0.999:
+        return "solved"
+    if delta_pr >= 0.05 and delta_gap <= 0.02:
+        return "improved"
+    if delta_pr >= 0.02:
+        return "slightly_improved"
+    if delta_pr <= -0.05:
+        return "regressed"
+    if delta_gap <= -0.05:
+        return "coverage_drift_reduced"
+    return "mixed_or_flat"
+
+
+def make_comparison_note(row: pd.Series) -> str:
+    status = classify_comparison_status(row)
+    delta_pr = _safe_float(row.get("delta_PR"))
+    delta_gap = _safe_float(row.get("delta_population_archive_gap"))
+    delta_reseed = _safe_float(row.get("delta_archive_reseed_total"))
+    current_mode = str(row.get("failure_mode_current", ""))
+    if status == "solved":
+        return "PR reached 1.0; keep this function as a regression guard"
+    if status in {"improved", "slightly_improved"}:
+        return f"PR improved by {delta_pr:.3f}; inspect whether failure mode changed from baseline"
+    if status == "regressed":
+        return f"PR regressed by {abs(delta_pr):.3f}; check conservative injection/reseed side effects"
+    if status == "coverage_drift_reduced":
+        return f"population/archive gap reduced by {abs(delta_gap):.3f}; reseed is likely helping"
+    if delta_reseed > 0 and current_mode == "population_coverage_drift":
+        return "reseed triggered but coverage drift remains; consider stronger or more frequent archive reseed"
+    return "no clear PR movement; use current failure_mode to choose the next mechanism"
+
+
 def classify_failure_mode(row: dict[str, Any]) -> str:
     pr = _safe_float(row.get("PR"))
     if pr >= 0.999:
@@ -383,6 +515,42 @@ def write_mechanism_report(report_md: Path, func_df: pd.DataFrame) -> None:
         f.write("\n")
 
 
+def write_mechanism_compare_report(
+    report_md: Path,
+    compare_df: pd.DataFrame,
+    baseline_dir: Path,
+    current_dir: Path,
+) -> None:
+    focus = compare_df[compare_df["func_num"].isin(sorted(CORE_FUNCS | HARD_FUNCS))]
+    with report_md.open("w", encoding="utf-8") as f:
+        f.write("# Mechanism Comparison Report\n\n")
+        f.write(f"- Baseline: `{baseline_dir}`\n")
+        f.write(f"- Current: `{current_dir}`\n\n")
+        f.write("## Focus Function Deltas\n\n")
+        cols = [
+            "func_name",
+            "group",
+            "PR_baseline",
+            "PR_current",
+            "delta_PR",
+            "delta_phase1_PR_pop_archive",
+            "delta_population_archive_gap",
+            "delta_phase2_PR_gain",
+            "delta_injection_total",
+            "delta_archive_reseed_total",
+            "failure_mode_baseline",
+            "failure_mode_current",
+            "comparison_status",
+            "comparison_note",
+        ]
+        existing = [col for col in cols if col in focus.columns]
+        f.write(to_markdown_table(focus[existing]))
+        f.write("\n\n## Comparison Status Counts\n\n")
+        counts = compare_df["comparison_status"].value_counts().rename_axis("comparison_status").reset_index(name="function_count")
+        f.write(to_markdown_table(counts))
+        f.write("\n")
+
+
 def summarize_by_function(run_df: pd.DataFrame) -> pd.DataFrame:
     grouped = run_df.groupby("func_num", as_index=False).agg(
         func_name=("func_name", "first"),
@@ -445,6 +613,18 @@ def _safe_float(value: Any, default: float = np.nan) -> float:
         return float(value)
     except (TypeError, ValueError):
         return float(default)
+
+
+def _series_float(series: Any) -> pd.Series:
+    if series is None:
+        return pd.Series(dtype=float)
+    return pd.to_numeric(series, errors="coerce")
+
+
+def _merged_numeric(df: pd.DataFrame, col: str) -> pd.Series:
+    if col not in df.columns:
+        return pd.Series(np.nan, index=df.index, dtype=float)
+    return pd.to_numeric(df[col], errors="coerce")
 
 
 def _col_mean(df: pd.DataFrame, col: str) -> float:
