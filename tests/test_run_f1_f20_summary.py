@@ -26,6 +26,9 @@ def test_run_f1_f20_summary_includes_mechanism_columns(tmp_path):
             "phase1_PR_pop_archive": 0.40,
             "phase2_PR_gain": 0.10,
             "phase2_seed_count": 12,
+            "injection_total_count": 3,
+            "injection_total_to_archive_count": 1,
+            "archive_reseed_total_count": 5,
             "coverage_proxy": 0.50,
             "effective_archive_clusters": 9,
         },
@@ -50,6 +53,9 @@ def test_run_f1_f20_summary_includes_mechanism_columns(tmp_path):
             "phase1_PR_pop_archive": 0.50,
             "phase2_PR_gain": 0.20,
             "phase2_seed_count": 14,
+            "injection_total_count": 5,
+            "injection_total_to_archive_count": 3,
+            "archive_reseed_total_count": 7,
             "coverage_proxy": 0.60,
             "effective_archive_clusters": 10,
         },
@@ -67,4 +73,6 @@ def test_run_f1_f20_summary_includes_mechanism_columns(tmp_path):
     assert float(summary.loc[0, "mean_population_archive_gap"]) == 0.20
     assert float(summary.loc[0, "mean_phase2_PR_gain"]) == 0.15
     assert float(summary.loc[0, "mean_phase2_seed_count"]) == 13.0
-
+    assert float(summary.loc[0, "mean_injection_total_count"]) == 4.0
+    assert float(summary.loc[0, "mean_injection_total_to_archive_count"]) == 2.0
+    assert float(summary.loc[0, "mean_archive_reseed_total_count"]) == 6.0

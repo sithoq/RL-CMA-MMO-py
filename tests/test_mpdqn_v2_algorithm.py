@@ -356,3 +356,7 @@ def test_v2_runner_registered_and_smoke_f1_small_budget():
     assert "effective_archive_clusters" in result
     assert "mp_head_hist" in result
     assert "reward_vector_mean" in result
+    assert "injection_total_count" in result
+    assert "archive_reseed_total_count" in result
+    assert result["injection_total_count"] >= 0
+    assert result["archive_reseed_total_count"] >= 0

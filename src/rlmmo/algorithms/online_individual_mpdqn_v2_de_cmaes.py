@@ -134,6 +134,11 @@ def run_optimizer(
     archive_cluster_hist: list[int] = []
     coverage_proxy = 0.0
     effective_archive_clusters = 0
+    total_injection_count = 0
+    total_injection_archive_gain = 0.0
+    total_injection_to_archive_count = 0
+    total_archive_reseed_count = 0
+    total_archive_reseed_fitness = 0.0
     phase_switch_fes = max_fes_total
     phase_switch_reason = "max_fes_exhausted"
     generation_index = 0
@@ -316,7 +321,8 @@ def run_optimizer(
         archive_reseed_count = 0
         archive_reseed_mean_fitness = 0.0
         archive_reseed_reason = "none"
-        if generation_index % max(1, int(cfg.injection_interval)) == 0 and fes < max_fes_total:
+        injection_checked = generation_index % max(1, int(cfg.injection_interval)) == 0 and fes < max_fes_total
+        if injection_checked:
             should_inject, injection_reason = _should_inject_coverage(
                 progress=fes / max_fes_total,
                 success_hist=success_hist,
@@ -358,9 +364,14 @@ def run_optimizer(
                 archive_cluster_hist[-1] = effective_archive_clusters
                 new_niches = build_dbscan_niches(pop, fitness, lb, ub)
                 diversity_hist[-1] = _population_diversity(pop, lb, ub)
-        elif cfg.coverage_injection:
+        if injection_count > 0:
+            total_injection_count += int(injection_count)
+            total_injection_archive_gain += float(injection_archive_gain)
+            total_injection_to_archive_count += int(injection_to_archive_count)
+        elif cfg.coverage_injection and not injection_checked:
             injection_reason = "interval_skip"
-        if generation_index % max(1, int(cfg.archive_reseed_interval)) == 0:
+        reseed_checked = generation_index % max(1, int(cfg.archive_reseed_interval)) == 0
+        if reseed_checked:
             should_reseed, archive_reseed_reason = _should_archive_reseed(
                 progress=fes / max_fes_total,
                 archive=archive,
@@ -391,7 +402,10 @@ def run_optimizer(
                 if archive_reseed_count > 0:
                     new_niches = build_dbscan_niches(pop, fitness, lb, ub)
                     diversity_hist[-1] = _population_diversity(pop, lb, ub)
-        elif cfg.archive_reseed_enabled:
+        if archive_reseed_count > 0:
+            total_archive_reseed_count += int(archive_reseed_count)
+            total_archive_reseed_fitness += float(archive_reseed_mean_fitness) * int(archive_reseed_count)
+        elif cfg.archive_reseed_enabled and not reseed_checked:
             archive_reseed_reason = "interval_skip"
         if injection_count > 0 or archive_reseed_count > 0:
             injected_best = float(np.max(fitness))
@@ -611,6 +625,13 @@ def run_optimizer(
         if phase2_log
         else 0.0,
         "phase2_PR_gain": float(phase2_pr_gain),
+        "injection_total_count": int(total_injection_count),
+        "injection_total_archive_gain": float(total_injection_archive_gain),
+        "injection_total_to_archive_count": int(total_injection_to_archive_count),
+        "archive_reseed_total_count": int(total_archive_reseed_count),
+        "archive_reseed_mean_fitness": float(total_archive_reseed_fitness / total_archive_reseed_count)
+        if total_archive_reseed_count > 0
+        else 0.0,
         "coverage_proxy": float(coverage_proxy),
         "effective_archive_clusters": int(effective_archive_clusters),
         "dqn_action_hist": ";".join(map(str, agent.action_hist.tolist())),
