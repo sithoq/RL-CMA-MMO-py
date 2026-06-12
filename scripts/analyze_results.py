@@ -38,6 +38,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="与当前 result_dir 做机制对比的基线目录；需要配合 --mechanism 使用。",
     )
+    parser.add_argument(
+        "--mechanism-only",
+        action="store_true",
+        help="只读取 summary/diagnostics 做机制分析，跳过 NPZ 和 count_goptima。",
+    )
     return parser.parse_args()
 
 
@@ -47,18 +52,28 @@ def main() -> None:
     if not result_dir.exists():
         raise FileNotFoundError(f"result_dir not found: {result_dir}")
 
+    out_prefix = Path(args.out_prefix) if args.out_prefix else result_dir / "analysis"
+    if not out_prefix.is_absolute():
+        out_prefix = resolve_output_dir(out_prefix)
+    out_prefix.parent.mkdir(parents=True, exist_ok=True)
+
+    if args.mechanism_only:
+        if not args.mechanism:
+            args.mechanism = True
+        write_mechanism_outputs(result_dir, out_prefix, args.baseline_dir)
+        return
+
     run_rows = collect_run_rows(result_dir, args.accuracy)
     if not run_rows:
+        if args.mechanism:
+            print(f"no NPZ runs found in {result_dir}; falling back to mechanism-only analysis")
+            write_mechanism_outputs(result_dir, out_prefix, args.baseline_dir)
+            return
         raise RuntimeError(f"no analyzable runs found in {result_dir}")
 
     run_df = pd.DataFrame(run_rows).sort_values(["func_num", "run_id"])
     func_df = summarize_by_function(run_df)
     overall_df = summarize_overall(func_df)
-
-    out_prefix = Path(args.out_prefix) if args.out_prefix else result_dir / "analysis"
-    if not out_prefix.is_absolute():
-        out_prefix = resolve_output_dir(out_prefix)
-    out_prefix.parent.mkdir(parents=True, exist_ok=True)
 
     run_csv = out_prefix.with_name(out_prefix.name + "_runs.csv")
     func_csv = out_prefix.with_name(out_prefix.name + "_functions.csv")
@@ -76,34 +91,7 @@ def main() -> None:
     print(report_md)
 
     if args.mechanism:
-        mechanism_run_df = collect_mechanism_rows(result_dir)
-        if mechanism_run_df.empty:
-            print("mechanism analysis skipped: no function CSV rows found")
-            return
-        mechanism_func_df = summarize_mechanism_by_function(mechanism_run_df)
-        mech_run_csv = out_prefix.with_name(out_prefix.name + "_mechanism_runs.csv")
-        mech_func_csv = out_prefix.with_name(out_prefix.name + "_mechanism_functions.csv")
-        mech_report_md = out_prefix.with_name(out_prefix.name + "_mechanism_report.md")
-        mechanism_run_df.to_csv(mech_run_csv, index=False, encoding="utf-8-sig")
-        mechanism_func_df.to_csv(mech_func_csv, index=False, encoding="utf-8-sig")
-        write_mechanism_report(mech_report_md, mechanism_func_df)
-        print(mech_run_csv)
-        print(mech_func_csv)
-        print(mech_report_md)
-        if args.baseline_dir:
-            baseline_dir = resolve_output_dir(args.baseline_dir)
-            baseline_run_df = collect_mechanism_rows(baseline_dir)
-            if baseline_run_df.empty:
-                print(f"mechanism comparison skipped: no baseline rows found in {baseline_dir}")
-            else:
-                baseline_func_df = summarize_mechanism_by_function(baseline_run_df)
-                compare_df = compare_mechanism_functions(baseline_func_df, mechanism_func_df)
-                compare_csv = out_prefix.with_name(out_prefix.name + "_mechanism_compare.csv")
-                compare_report_md = out_prefix.with_name(out_prefix.name + "_mechanism_compare_report.md")
-                compare_df.to_csv(compare_csv, index=False, encoding="utf-8-sig")
-                write_mechanism_compare_report(compare_report_md, compare_df, baseline_dir, result_dir)
-                print(compare_csv)
-                print(compare_report_md)
+        write_mechanism_outputs(result_dir, out_prefix, args.baseline_dir)
 
 
 def collect_run_rows(result_dir: Path, accuracy: float) -> list[dict[str, Any]]:
@@ -153,6 +141,41 @@ def collect_run_rows(result_dir: Path, accuracy: float) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def write_mechanism_outputs(result_dir: Path, out_prefix: Path, baseline_dir_text: str | None = None) -> None:
+    """Write mechanism CSV/Markdown outputs without requiring NPZ files."""
+
+    mechanism_run_df = collect_mechanism_rows(result_dir)
+    if mechanism_run_df.empty:
+        print("mechanism analysis skipped: no function CSV rows found")
+        return
+    mechanism_func_df = summarize_mechanism_by_function(mechanism_run_df)
+    mech_run_csv = out_prefix.with_name(out_prefix.name + "_mechanism_runs.csv")
+    mech_func_csv = out_prefix.with_name(out_prefix.name + "_mechanism_functions.csv")
+    mech_report_md = out_prefix.with_name(out_prefix.name + "_mechanism_report.md")
+    mechanism_run_df.to_csv(mech_run_csv, index=False, encoding="utf-8-sig")
+    mechanism_func_df.to_csv(mech_func_csv, index=False, encoding="utf-8-sig")
+    write_mechanism_report(mech_report_md, mechanism_func_df)
+    print(mech_run_csv)
+    print(mech_func_csv)
+    print(mech_report_md)
+
+    if not baseline_dir_text:
+        return
+    baseline_dir = resolve_output_dir(baseline_dir_text)
+    baseline_run_df = collect_mechanism_rows(baseline_dir)
+    if baseline_run_df.empty:
+        print(f"mechanism comparison skipped: no baseline rows found in {baseline_dir}")
+        return
+    baseline_func_df = summarize_mechanism_by_function(baseline_run_df)
+    compare_df = compare_mechanism_functions(baseline_func_df, mechanism_func_df)
+    compare_csv = out_prefix.with_name(out_prefix.name + "_mechanism_compare.csv")
+    compare_report_md = out_prefix.with_name(out_prefix.name + "_mechanism_compare_report.md")
+    compare_df.to_csv(compare_csv, index=False, encoding="utf-8-sig")
+    write_mechanism_compare_report(compare_report_md, compare_df, baseline_dir, result_dir)
+    print(compare_csv)
+    print(compare_report_md)
 
 
 def load_csv_rows(result_dir: Path) -> dict[tuple[int, int], dict[str, Any]]:
