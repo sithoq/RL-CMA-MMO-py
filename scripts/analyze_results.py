@@ -21,6 +21,20 @@ RUN_NPZ_RE = re.compile(r"^F(?P<func>\d{2})_run(?P<run>\d{3})_seed(?P<seed>\d+)_
 CORE_FUNCS = {1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13}
 HIGH_PEAK_FUNCS = {8, 9}
 HARD_FUNCS = {14, 15, 16, 17, 18, 19, 20}
+CORE_ACCEPTANCE_TARGETS = {
+    1: 1.00,
+    2: 1.00,
+    3: 1.00,
+    4: 1.00,
+    5: 1.00,
+    6: 0.80,
+    7: 0.85,
+    10: 1.00,
+    11: 0.95,
+    12: 0.75,
+    13: 0.85,
+}
+HARD_BREAKTHROUGH_FUNCS = {14, 16, 18}
 
 
 def parse_args() -> argparse.Namespace:
@@ -345,6 +359,9 @@ def summarize_mechanism_by_function(run_df: pd.DataFrame) -> pd.DataFrame:
     )
     grouped["failure_mode"] = grouped.apply(lambda row: classify_failure_mode(row.to_dict()), axis=1)
     grouped["next_action"] = grouped.apply(lambda row: recommend_next_action(row.to_dict()), axis=1)
+    grouped["acceptance_target"] = grouped["func_num"].map(CORE_ACCEPTANCE_TARGETS)
+    grouped["acceptance_status"] = grouped.apply(classify_function_acceptance, axis=1)
+    grouped["acceptance_note"] = grouped.apply(make_function_acceptance_note, axis=1)
     return grouped.sort_values(["group", "func_num"])
 
 
@@ -393,6 +410,8 @@ def compare_mechanism_functions(baseline_df: pd.DataFrame, current_df: pd.DataFr
 
     merged["comparison_status"] = merged.apply(classify_comparison_status, axis=1)
     merged["comparison_note"] = merged.apply(make_comparison_note, axis=1)
+    merged["acceptance_status"] = merged.apply(classify_compare_acceptance, axis=1)
+    merged["acceptance_note"] = merged.apply(make_compare_acceptance_note, axis=1)
 
     ordered_cols = [
         "func_num",
@@ -420,6 +439,8 @@ def compare_mechanism_functions(baseline_df: pd.DataFrame, current_df: pd.DataFr
         "failure_mode_current",
         "comparison_status",
         "comparison_note",
+        "acceptance_status",
+        "acceptance_note",
     ]
     existing = [col for col in ordered_cols if col in merged.columns]
     return merged[existing].sort_values(["group", "func_num"])
@@ -440,6 +461,109 @@ def classify_comparison_status(row: pd.Series) -> str:
     if delta_gap <= -0.05:
         return "coverage_drift_reduced"
     return "mixed_or_flat"
+
+
+def classify_function_acceptance(row: pd.Series) -> str:
+    func_num = int(_safe_float(row.get("func_num")))
+    pr = _safe_float(row.get("PR"))
+    if func_num in CORE_ACCEPTANCE_TARGETS:
+        target = CORE_ACCEPTANCE_TARGETS[func_num]
+        return "pass" if pr + 1e-12 >= target else "fail"
+    if func_num in HIGH_PEAK_FUNCS:
+        return "record_only"
+    if func_num in HARD_FUNCS:
+        return "needs_baseline"
+    return "not_scored"
+
+
+def make_function_acceptance_note(row: pd.Series) -> str:
+    func_num = int(_safe_float(row.get("func_num")))
+    pr = _safe_float(row.get("PR"))
+    if func_num in CORE_ACCEPTANCE_TARGETS:
+        target = CORE_ACCEPTANCE_TARGETS[func_num]
+        return f"target PR >= {target:.2f}; current PR = {pr:.3f}"
+    if func_num in HIGH_PEAK_FUNCS:
+        return "F8/F9 are recorded as high-peak stress tests, not primary acceptance gates"
+    if func_num in HARD_FUNCS:
+        return "hard-function gate requires baseline comparison: no regression and visible improvement"
+    return ""
+
+
+def classify_compare_acceptance(row: pd.Series) -> str:
+    func_num = int(_safe_float(row.get("func_num")))
+    pr_current = _safe_float(row.get("PR_current"))
+    delta_pr = _safe_float(row.get("delta_PR"))
+    if func_num in CORE_ACCEPTANCE_TARGETS:
+        target = CORE_ACCEPTANCE_TARGETS[func_num]
+        return "pass" if pr_current + 1e-12 >= target else "fail"
+    if func_num in HIGH_PEAK_FUNCS:
+        return "record_only"
+    if func_num in HARD_FUNCS:
+        if delta_pr < -0.02:
+            return "regressed"
+        if func_num in HARD_BREAKTHROUGH_FUNCS and pr_current > (2.0 / 3.0 + 1e-6):
+            return "breakthrough"
+        if delta_pr >= 0.05:
+            return "improved"
+        return "stable"
+    return "not_scored"
+
+
+def make_compare_acceptance_note(row: pd.Series) -> str:
+    func_num = int(_safe_float(row.get("func_num")))
+    pr_current = _safe_float(row.get("PR_current"))
+    delta_pr = _safe_float(row.get("delta_PR"))
+    if func_num in CORE_ACCEPTANCE_TARGETS:
+        target = CORE_ACCEPTANCE_TARGETS[func_num]
+        return f"target PR >= {target:.2f}; current PR = {pr_current:.3f}; delta PR = {delta_pr:.3f}"
+    if func_num in HIGH_PEAK_FUNCS:
+        return "record only; do not tune main algorithm around this gate"
+    if func_num in HARD_FUNCS:
+        return f"hard gate: no regression, seek >=2 improved functions and F14/F16/F18 breakthrough; delta PR = {delta_pr:.3f}"
+    return ""
+
+
+def build_acceptance_summary(compare_df: pd.DataFrame) -> pd.DataFrame:
+    """Build coarse experiment-level acceptance gates from function comparisons."""
+
+    rows: list[dict[str, Any]] = []
+    core = compare_df[compare_df["func_num"].isin(CORE_ACCEPTANCE_TARGETS)]
+    hard = compare_df[compare_df["func_num"].isin(HARD_FUNCS)]
+    if not core.empty:
+        passed = int((core["acceptance_status"] == "pass").sum())
+        rows.append(
+            {
+                "gate": "core_targets",
+                "passed": passed == int(core.shape[0]),
+                "detail": f"{passed}/{int(core.shape[0])} core functions reached their PR targets",
+            }
+        )
+    if not hard.empty:
+        regressed = int((hard["acceptance_status"] == "regressed").sum())
+        improved = int(hard["acceptance_status"].isin(["improved", "breakthrough"]).sum())
+        breakthrough = int((hard["acceptance_status"] == "breakthrough").sum())
+        rows.extend(
+            [
+                {
+                    "gate": "hard_no_regression",
+                    "passed": regressed == 0,
+                    "detail": f"{regressed} hard functions regressed by more than 0.02 PR",
+                },
+                {
+                    "gate": "hard_at_least_two_improved",
+                    "passed": improved >= 2,
+                    "detail": f"{improved} hard functions improved by at least 0.05 PR or broke through",
+                },
+                {
+                    "gate": "F14_F16_F18_breakthrough",
+                    "passed": breakthrough >= 1,
+                    "detail": f"{breakthrough} of F14/F16/F18 exceeded PR=0.667",
+                },
+            ]
+        )
+    if not rows:
+        rows.append({"gate": "no_scored_functions", "passed": False, "detail": "No core or hard functions found"})
+    return pd.DataFrame(rows)
 
 
 def make_comparison_note(row: pd.Series) -> str:
@@ -535,6 +659,8 @@ def write_mechanism_report(report_md: Path, func_df: pd.DataFrame) -> None:
             "archive_reseed_total",
             "failure_mode",
             "next_action",
+            "acceptance_status",
+            "acceptance_note",
         ]
         existing = [col for col in cols if col in focus.columns]
         f.write(to_markdown_table(focus[existing]))
@@ -571,9 +697,13 @@ def write_mechanism_compare_report(
             "failure_mode_current",
             "comparison_status",
             "comparison_note",
+            "acceptance_status",
+            "acceptance_note",
         ]
         existing = [col for col in cols if col in focus.columns]
         f.write(to_markdown_table(focus[existing]))
+        f.write("\n\n## Acceptance Summary\n\n")
+        f.write(to_markdown_table(build_acceptance_summary(compare_df)))
         f.write("\n\n## Comparison Status Counts\n\n")
         counts = compare_df["comparison_status"].value_counts().rename_axis("comparison_status").reset_index(name="function_count")
         f.write(to_markdown_table(counts))

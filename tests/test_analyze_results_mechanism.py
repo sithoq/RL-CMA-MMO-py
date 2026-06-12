@@ -1,6 +1,11 @@
 import pandas as pd
 
-from scripts.analyze_results import collect_mechanism_rows, summarize_mechanism_by_function
+from scripts.analyze_results import (
+    build_acceptance_summary,
+    collect_mechanism_rows,
+    compare_mechanism_functions,
+    summarize_mechanism_by_function,
+)
 
 
 def test_mechanism_analysis_uses_summary_totals_without_diagnostics(tmp_path):
@@ -48,4 +53,32 @@ def test_mechanism_analysis_uses_summary_totals_without_diagnostics(tmp_path):
     assert float(run_df.loc[0, "archive_reseed_mean_fitness"]) == 0.75
     assert float(func_df.loc[0, "archive_reseed_total"]) == 6.0
     assert func_df.loc[0, "failure_mode"] == "population_coverage_drift"
+    assert func_df.loc[0, "acceptance_status"] == "fail"
+    assert "target PR" in func_df.loc[0, "acceptance_note"]
 
+
+def test_acceptance_summary_scores_core_and_hard_gates():
+    baseline = pd.DataFrame(
+        [
+            {"func_num": 6, "func_name": "F06", "group": "core", "runs": 3, "PR": 0.65},
+            {"func_num": 14, "func_name": "F14", "group": "hard", "runs": 3, "PR": 0.667},
+            {"func_num": 15, "func_name": "F15", "group": "hard", "runs": 3, "PR": 0.40},
+        ]
+    )
+    current = pd.DataFrame(
+        [
+            {"func_num": 6, "func_name": "F06", "group": "core", "runs": 3, "PR": 0.82},
+            {"func_num": 14, "func_name": "F14", "group": "hard", "runs": 3, "PR": 0.75},
+            {"func_num": 15, "func_name": "F15", "group": "hard", "runs": 3, "PR": 0.46},
+        ]
+    )
+
+    compare = compare_mechanism_functions(baseline, current)
+    summary = build_acceptance_summary(compare)
+
+    assert compare.loc[compare["func_num"] == 6, "acceptance_status"].iloc[0] == "pass"
+    assert compare.loc[compare["func_num"] == 14, "acceptance_status"].iloc[0] == "breakthrough"
+    assert compare.loc[compare["func_num"] == 15, "acceptance_status"].iloc[0] == "improved"
+    assert bool(summary.loc[summary["gate"] == "hard_no_regression", "passed"].iloc[0]) is True
+    assert bool(summary.loc[summary["gate"] == "hard_at_least_two_improved", "passed"].iloc[0]) is True
+    assert bool(summary.loc[summary["gate"] == "F14_F16_F18_breakthrough", "passed"].iloc[0]) is True
