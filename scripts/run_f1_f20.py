@@ -37,6 +37,23 @@ def _resolve_funcs(funcs: str, func_group: str | None) -> list[int]:
     return _parse_funcs(funcs)
 
 
+def _dry_run_summary(args: argparse.Namespace, funcs: list[int]) -> str:
+    max_fes = "benchmark_default" if args.max_fes is None else str(args.max_fes)
+    return "\n".join(
+        [
+            "DRY RUN: no experiments will be executed.",
+            f"algorithm={args.algorithm}",
+            f"funcs={','.join(str(x) for x in funcs)}",
+            f"runs={args.runs}",
+            f"workers={args.workers}",
+            f"max_fes={max_fes}",
+            f"diagnostics={bool(args.diagnostics)}",
+            f"analyze_mechanism={bool(args.analyze_mechanism)}",
+            f"out={resolve_output_dir(args.out)}",
+        ]
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--runs", type=int, default=10)
@@ -55,8 +72,13 @@ def main() -> None:
     parser.add_argument("--analyze-mechanism", action="store_true")
     parser.add_argument("--baseline-dir", default=None)
     parser.add_argument("--analysis-prefix", default=None)
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     algorithm_config = json.loads(args.algorithm_config_json) if args.algorithm_config_json else None
+    funcs = _resolve_funcs(args.funcs, args.func_group)
+    if args.dry_run:
+        print(_dry_run_summary(args, funcs))
+        return
     csv_path, md_path = run_f1_f20(
         runs=args.runs,
         workers=args.workers,
@@ -64,7 +86,7 @@ def main() -> None:
         init_method=args.init_method,
         out_dir=args.out,
         algorithm=args.algorithm,
-        funcs=_resolve_funcs(args.funcs, args.func_group),
+        funcs=funcs,
         max_fes=args.max_fes,
         diagnostics=args.diagnostics,
         diagnostic_interval=args.diagnostic_interval,

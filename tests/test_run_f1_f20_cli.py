@@ -1,4 +1,6 @@
-from scripts.run_f1_f20 import _parse_funcs, _resolve_funcs
+from argparse import Namespace
+
+from scripts.run_f1_f20 import _dry_run_summary, _parse_funcs, _resolve_funcs
 
 
 def test_parse_funcs_keeps_existing_range_and_list_behavior():
@@ -31,3 +33,23 @@ def test_resolve_func_group_presets():
         20,
     ]
 
+
+def test_dry_run_summary_lists_resolved_experiment_settings(tmp_path):
+    args = Namespace(
+        algorithm="online_individual_mpdqn_v2_de_cmaes",
+        runs=5,
+        workers=2,
+        max_fes=None,
+        diagnostics=True,
+        analyze_mechanism=True,
+        out=str(tmp_path),
+    )
+
+    text = _dry_run_summary(args, [1, 2, 3])
+
+    assert "DRY RUN" in text
+    assert "online_individual_mpdqn_v2_de_cmaes" in text
+    assert "funcs=1,2,3" in text
+    assert "runs=5" in text
+    assert "max_fes=benchmark_default" in text
+    assert "diagnostics=True" in text
