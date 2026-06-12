@@ -6,9 +6,13 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
 from rlmmo.runners.run_f1_f20 import run_f1_f20
+from rlmmo.runners.run_one_func import resolve_output_dir
+
+from scripts.analyze_results import write_mechanism_outputs
 
 
 FUNC_GROUPS: dict[str, list[int]] = {
@@ -48,6 +52,9 @@ def main() -> None:
     parser.add_argument("--diagnostic-interval", type=int, default=1)
     parser.add_argument("--save-pop-snapshots", action="store_true")
     parser.add_argument("--algorithm-config-json", default=None)
+    parser.add_argument("--analyze-mechanism", action="store_true")
+    parser.add_argument("--baseline-dir", default=None)
+    parser.add_argument("--analysis-prefix", default=None)
     args = parser.parse_args()
     algorithm_config = json.loads(args.algorithm_config_json) if args.algorithm_config_json else None
     csv_path, md_path = run_f1_f20(
@@ -66,6 +73,12 @@ def main() -> None:
     )
     print(csv_path)
     print(md_path)
+    if args.analyze_mechanism:
+        out_dir = Path(csv_path).parent
+        analysis_prefix = Path(args.analysis_prefix) if args.analysis_prefix else out_dir / "analysis"
+        if not analysis_prefix.is_absolute():
+            analysis_prefix = resolve_output_dir(analysis_prefix)
+        write_mechanism_outputs(out_dir, analysis_prefix, args.baseline_dir)
 
 
 if __name__ == "__main__":
