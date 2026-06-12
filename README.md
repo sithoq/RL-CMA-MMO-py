@@ -5,8 +5,9 @@
 当前主线：
 
 ```text
-阶段一：DBSCAN 小生境 + 共享 Double DQN 辅助 DE，用于提高峰覆盖率
-阶段二：DBSCAN 候选峰 + pycma 完整 CMA-ES 精搜，用于提高峰定位精度
+阶段一：个体级 Multi-Preference Double DQN 辅助 KNN-DE，用于提高峰覆盖率
+阶段一辅助：PeakArchive、conservative injection、archive reseed，用于降低覆盖流失
+阶段二：population + archive 经 DBSCAN 提取多 seed，再用 pycma CMA-ES 精搜
 ```
 
 ## 安装
@@ -23,7 +24,7 @@ pip install -e .[dev]
 ```bash
 python scripts/run_one_func.py --func 1 --runs 1 --max-fes 5000
 python scripts/run_one_func.py --func 7 --runs 1 --max-fes 10000
-python scripts/run_f1_f20.py --runs 10 --workers 12 --out results/online_dqn_de_cmaes_10runs
+python scripts/run_f1_f20.py --algorithm online_individual_mpdqn_v2_de_cmaes --func-group core --runs 5 --diagnostics --out results/core_reseed_diagnostics --analyze-mechanism --baseline-dir results/f1_f20_diagnostics --dry-run
 ```
 
 ## 当前 PR 改进实验流程
