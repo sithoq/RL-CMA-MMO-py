@@ -227,7 +227,7 @@ def collect_mechanism_rows(result_dir: Path) -> pd.DataFrame:
             "FES": _safe_float(row.get("FES")),
             "maxFES": _safe_float(row.get("maxFES")),
         }
-        base.update(_summarize_generation_log(diag))
+        base.update(_summarize_generation_log(diag, row))
         base.update(_summarize_phase2_log(phase2))
         base["population_archive_gap"] = base["phase1_PR_archive"] - base["phase1_PR_pop"]
         base["phase2_effective"] = float(base["phase2_PR_gain"] >= 0.05)
@@ -265,15 +265,18 @@ def _diagnostic_path(raw: Any, diagnostics_dir: Path) -> Path | None:
     return path
 
 
-def _summarize_generation_log(df: pd.DataFrame | None) -> dict[str, Any]:
+def _summarize_generation_log(df: pd.DataFrame | None, summary_row: dict[str, Any] | None = None) -> dict[str, Any]:
+    summary_row = summary_row or {}
     if df is None or df.empty:
         return {
             "mean_action_entropy": np.nan,
             "late_success_rate": np.nan,
             "late_individual_stag_mean": np.nan,
-            "injection_total": np.nan,
-            "injection_to_archive_total": np.nan,
-            "archive_reseed_total": np.nan,
+            "injection_total": _safe_float(summary_row.get("injection_total_count")),
+            "injection_to_archive_total": _safe_float(summary_row.get("injection_total_to_archive_count")),
+            "injection_archive_gain_total": _safe_float(summary_row.get("injection_total_archive_gain")),
+            "archive_reseed_total": _safe_float(summary_row.get("archive_reseed_total_count")),
+            "archive_reseed_mean_fitness": _safe_float(summary_row.get("archive_reseed_mean_fitness")),
             "last_archive_reseed_reason": "",
             "last_injection_reason": "",
         }
@@ -284,6 +287,7 @@ def _summarize_generation_log(df: pd.DataFrame | None) -> dict[str, Any]:
         "late_individual_stag_mean": _col_mean(late, "individual_stag_mean"),
         "injection_total": _col_sum(df, "injection_count"),
         "injection_to_archive_total": _col_sum(df, "injection_to_archive_count"),
+        "injection_archive_gain_total": _col_sum(df, "injection_archive_gain"),
         "archive_reseed_total": _col_sum(df, "archive_reseed_count"),
         "last_archive_reseed_reason": _last_text(df, "archive_reseed_reason"),
         "last_injection_reason": _last_text(df, "injection_reason"),
@@ -325,7 +329,9 @@ def summarize_mechanism_by_function(run_df: pd.DataFrame) -> pd.DataFrame:
         "late_individual_stag_mean",
         "injection_total",
         "injection_to_archive_total",
+        "injection_archive_gain_total",
         "archive_reseed_total",
+        "archive_reseed_mean_fitness",
         "phase2_archive_seed_ratio",
         "phase2_mean_used_fes",
         "phase2_mean_seed_gain",
